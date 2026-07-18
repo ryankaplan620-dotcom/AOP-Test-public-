@@ -83,11 +83,12 @@ jobs:
       - name: Test
         working-directory: optimizer
         run: python -m unittest discover -v
-      - name: CLI smoke (incl. Semantic Policy Rewriter artifact)
+      - name: CLI smoke (rewriter artifact + what-if simulator)
         working-directory: optimizer
         run: |
-          echo "We charge a 15% restocking fee. Returns within 14 days for store credit only. Ships in 4-6 business days." \
-            | python -m aop_optimizer --pretty --jsonld
+          POLICY="We charge a 15% restocking fee. Returns within 14 days for store credit only. Ships in 4-6 business days."
+          echo "$POLICY" | python -m aop_optimizer --pretty --jsonld
+          echo "$POLICY" | python -m aop_optimizer --pretty --simulate
 
   # ---------------------------------------------------------------------------
   dashboard:
