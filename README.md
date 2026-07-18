@@ -61,6 +61,7 @@ flowchart LR
 | `services/ingestion/` | Telemetry ingest, webhook receiver, attribution stitch, loss sweep | Node.js, Express, `pg` |
 | `optimizer/` | Agent Match Score policy engine + CLI + HTTP microservice + JSON-LD rewriter | Python 3.11, stdlib only |
 | `dashboard/` | Merchant dashboard: Loss Diagnosis screen + Data Optimizer panel | React 18, Vite |
+| `demo/` | One-command demo: mock Shopify storefront + agent traffic simulator | Node stdlib |
 | `docs/` | Architecture + local development guides | — |
 
 ## Quickstart
@@ -94,9 +95,15 @@ cd ../dashboard && npm install
 npm run dev                            # then set URLs + token in its Settings tab
 ```
 
-See [docs/local-development.md](docs/local-development.md) for the full end-to-end
-walkthrough (seeding a merchant, simulating agent pings and signed Shopify
-webhooks, watching the loss sweep fire).
+**Or run everything at once:** `./demo/run-demo.sh` boots PostgreSQL,
+migrations, the ingestion service, the optimizer, a mock Shopify storefront
+that signs real webhooks, a continuous agent-traffic simulator (~30% of
+sessions convert; the rest expire into every loss reason), and the dashboard
+— a fully populated Loss Diagnosis screen within ~90 seconds.
+
+See [docs/local-development.md](docs/local-development.md) for the manual
+end-to-end walkthrough (seeding a merchant, simulating agent pings and signed
+Shopify webhooks, watching the loss sweep fire).
 
 ## Testing
 
@@ -107,6 +114,7 @@ cd edge && npm test                          # 40 tests — plain Node 22, no wr
 cd services/ingestion && npm test            # 83 tests — pure libs, pass before npm install
 cd optimizer && python3 -m unittest discover # 123 tests — stdlib only (incl. HTTP server + JSON-LD)
 cd dashboard && npm test && npm run build    # pure helpers + production build
+node --test demo/test/scenarios.test.mjs     # demo scenario generator
 cd db && node --check migrate.mjs            # runner syntax; SQL verified against PG16
 ```
 

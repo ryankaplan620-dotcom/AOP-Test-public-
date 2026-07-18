@@ -111,6 +111,25 @@ jobs:
         run: npm run build
 
   # ---------------------------------------------------------------------------
+  demo:
+    name: demo — harness scripts + scenario generator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Zero-dependency stdlib scripts: syntax + the pure scenario suite.
+      - name: Syntax check
+        run: |
+          node --check demo/mock-storefront.mjs
+          node --check demo/agent-simulator.mjs
+          node --check demo/lib/scenarios.js
+          bash -n demo/run-demo.sh
+      - name: Test
+        run: node --test demo/test/scenarios.test.mjs
+
+  # ---------------------------------------------------------------------------
   db:
     name: db — migrations (PostgreSQL 16)
     runs-on: ubuntu-latest
