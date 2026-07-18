@@ -1,0 +1,11 @@
+# AOP :: optimizer/requirements.txt
+#
+# The AOP policy scoring engine (aop_optimizer) is intentionally pure
+# Python 3.11 STANDARD LIBRARY: re, json, math, dataclasses, argparse,
+# typing, unittest.  There are NO runtime or test dependencies to install.
+#
+# This file exists (comment-only) so tooling that expects a requirements
+# manifest per component finds an explicit, auditable statement of that
+# fact rather than a missing file.
+#
+# (nothing to install)

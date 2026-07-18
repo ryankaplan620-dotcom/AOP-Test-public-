@@ -1,0 +1,16 @@
+{
+  "name": "aop-db",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Agent Optimization Platform — PostgreSQL storage layer: schema migrations and the deploy-time migration runner. See README.md for the schema overview.",
+  "type": "module",
+  "scripts": {
+    "migrate": "node migrate.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "@aop/edge-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AOP zero-latency Cloudflare Worker edge proxy. Sits between AI shopping agents (ACP/AP2) and headless Shopify/BigCommerce origins: transparently proxies all traffic, intercepts intent endpoints (/availability, /shipping_quote) to emit telemetry into the EDGE_LOG_QUEUE Cloudflare Queue, and batches queue messages via HTTPS into the AOP ingestion service. No runtime dependencies by design: the worker must stay tiny to hold the <5ms overhead budget, and tests run on plain Node (node --test) with no network or wrangler required.",
+  "scripts": {
+    "test": "node --test test/proxy.test.mjs test/telemetry.test.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.20.0"
+  }
+}

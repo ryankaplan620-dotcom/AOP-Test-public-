@@ -1,0 +1,19 @@
+{
+  "name": "@aop/ingestion",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AOP Node.js ingestion + attribution service: receives edge-proxy intent telemetry (Worker Ingestion Engine), Shopify order-created webhooks (Webhook Receiver Engine), stitches cookie-less attribution via X-Agent-Transaction-Token, and sweeps expired intents into loss_diagnostics.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/auth.test.mjs test/commission.test.mjs test/loss-classifier.test.mjs test/shopify-hmac.test.mjs test/validate-telemetry.test.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.12.0"
+  }
+}
