@@ -133,7 +133,21 @@ psql postgres://aop:aop@localhost:5432/aop -c "SELECT * FROM purge_expired_telem
 Deletes intent telemetry older than 90 days (dependent diagnostics cascade);
 billing rows are never touched. Schedule in production via pg_cron or a cron job.
 
-## 8. Score a store policy
+## 8. Dashboard + optimizer panel
+
+```bash
+cd optimizer && python3 -m aop_optimizer.server &        # :8899
+cd ../dashboard && npm install && npm run dev            # Vite dev server
+```
+
+Open the dev URL, go to **Settings**, set the ingestion URL
+(`http://localhost:8787`), the `DASHBOARD_API_TOKEN` value you started the
+service with, and the optimizer URL (`http://localhost:8899`). The Loss
+Diagnosis tab then shows the seeded metrics live; the Data Optimizer tab runs
+the scan end-to-end. (Set `DASHBOARD_API_TOKEN` when starting the ingestion
+service in step 3 — without it the /analytics routes answer 503.)
+
+## 9. Score a store policy
 
 ```bash
 cd optimizer

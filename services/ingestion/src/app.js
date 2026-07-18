@@ -20,6 +20,7 @@
 import express from 'express';
 import { buildTelemetryRouter } from './routes/telemetry.js';
 import { buildWebhooksRouter } from './routes/webhooks.js';
+import { buildAnalyticsRouter } from './routes/analytics.js';
 
 /**
  * @param {{config: object, db: object, logger: object}} deps
@@ -45,6 +46,10 @@ export function buildApp({ config, db, logger }) {
 
   // ---- 3. Worker Ingestion Engine ---------------------------------------
   app.use('/ingest', buildTelemetryRouter({ config, db, logger: logger.child('telemetry') }));
+
+  // ---- 3b. Dashboard analytics reads (bearer-gated; 503 until the
+  // DASHBOARD_API_TOKEN feature gate is configured) -----------------------
+  app.use('/analytics', buildAnalyticsRouter({ config, db, logger: logger.child('analytics') }));
 
   // ---- 4. Health probe ---------------------------------------------------
   // SELECT 1 proves the full path to PostgreSQL (pool checkout + round-trip),

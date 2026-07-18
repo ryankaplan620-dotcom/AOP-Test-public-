@@ -43,6 +43,7 @@ import sys
 from typing import List, Optional
 
 from .directives import build_directive_payload
+from .jsonld import build_policy_jsonld
 from .scoring import AgentOptimizationEngine
 from .semantics import parse_policy_semantics
 
@@ -88,6 +89,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=12.0,
         metavar="N",
         help="logistic temperature, must be > 0 (default 12)",
+    )
+    parser.add_argument(
+        "--jsonld",
+        action="store_true",
+        help=(
+            "include the Semantic Policy Rewriter artifact (schema.org "
+            "JSON-LD for the current and optimized policy plus the "
+            "agent-parseable rewritten text) under 'policy_jsonld'"
+        ),
     )
     return parser
 
@@ -158,6 +168,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         report = engine.evaluate(metrics)
         payload = build_directive_payload(metrics, report)
+        if args.jsonld:
+            # Sprint 6 lever: attach the structured-data rewrite artifact so
+            # one CLI call yields both the diagnosis and the fix.
+            payload["policy_jsonld"] = build_policy_jsonld(metrics, report)
         print(json.dumps(payload, indent=2 if args.pretty else None))
         return EXIT_OK
     except Exception as exc:  # pragma: no cover - pipeline is non-raising

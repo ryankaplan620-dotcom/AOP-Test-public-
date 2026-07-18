@@ -59,7 +59,8 @@ flowchart LR
 | `edge/` | Zero-latency listening proxy + queue consumer | Cloudflare Workers (no runtime deps) |
 | `db/` | PostgreSQL schema migrations + runner | SQL, `pg` |
 | `services/ingestion/` | Telemetry ingest, webhook receiver, attribution stitch, loss sweep | Node.js, Express, `pg` |
-| `optimizer/` | Agent Match Score policy engine + CLI | Python 3.11, stdlib only |
+| `optimizer/` | Agent Match Score policy engine + CLI + HTTP microservice + JSON-LD rewriter | Python 3.11, stdlib only |
+| `dashboard/` | Merchant dashboard: Loss Diagnosis screen + Data Optimizer panel | React 18, Vite |
 | `docs/` | Architecture + local development guides | — |
 
 ## Quickstart
@@ -82,10 +83,15 @@ cd ../edge && npm install
 npx wrangler secret put INGEST_API_TOKEN
 npm run deploy
 
-# 4. Optimizer
+# 4. Optimizer (CLI, or as the dashboard's microservice)
 cd ../optimizer
 echo "Ships in 4-6 business days. 14-day returns, store credit only." \
-  | python3 -m aop_optimizer --pretty
+  | python3 -m aop_optimizer --pretty --jsonld
+python3 -m aop_optimizer.server        # HTTP: POST /score, POST /rewrite on :8899
+
+# 5. Dashboard (Loss Diagnosis screen + Data Optimizer panel)
+cd ../dashboard && npm install
+npm run dev                            # then set URLs + token in its Settings tab
 ```
 
 See [docs/local-development.md](docs/local-development.md) for the full end-to-end
@@ -98,8 +104,9 @@ Every suite runs offline — no network, no external services:
 
 ```bash
 cd edge && npm test                          # 40 tests — plain Node 22, no wrangler
-cd services/ingestion && npm test            # 78 tests — pure libs, pass before npm install
-cd optimizer && python3 -m unittest discover # 105 tests — stdlib only
+cd services/ingestion && npm test            # 83 tests — pure libs, pass before npm install
+cd optimizer && python3 -m unittest discover # 123 tests — stdlib only (incl. HTTP server + JSON-LD)
+cd dashboard && npm test && npm run build    # pure helpers + production build
 cd db && node --check migrate.mjs            # runner syntax; SQL verified against PG16
 ```
 
@@ -116,6 +123,9 @@ cd db && node --check migrate.mjs            # runner syntax; SQL verified again
 | `MERCHANT_ROUTES` | edge (`[vars]`) | JSON map: proxy hostname → merchant origin base URL |
 | `DEFAULT_ORIGIN` | edge (`[vars]`) | Fallback origin; empty = 502 unknown hostnames |
 | `INGEST_API_URL` | edge (`[vars]`) | Base URL of the ingestion service |
+| `DASHBOARD_API_TOKEN` | ingestion | Bearer token gating the read-only `/analytics/*` routes (unset = analytics disabled) |
+| `DASHBOARD_ALLOWED_ORIGIN` | ingestion | CORS origin reflected on `/analytics/*` (default `*`; pin in production) |
+| `AOP_OPTIMIZER_HOST` / `AOP_OPTIMIZER_PORT` | optimizer server | Bind address of the scoring microservice (default `127.0.0.1:8899`) |
 
 ## Compliance posture
 

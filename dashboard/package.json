@@ -1,0 +1,21 @@
+{
+  "name": "@aop/dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AOP merchant dashboard — the Loss Diagnosis screen (agent impressions, reconciled orders, estimated losses, drop-off analysis, live WON/LOST stream) and the Data Optimizer panel (Agent Match Score + Semantic Policy Rewriter). React SPA served statically; reads the ingestion service's bearer-gated /analytics API and the optimizer microservice's /score + /rewrite endpoints.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test test/format.test.mjs"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^5.4.11"
+  }
+}

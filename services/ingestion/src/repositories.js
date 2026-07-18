@@ -256,3 +256,124 @@ export async function insertLossDiagnostic(
   );
   return { inserted: (result.rowCount ?? 0) > 0 };
 }
+
+// ===========================================================================
+// Dashboard analytics reads (routes/analytics.js).
+//
+// All read-only aggregates for the Loss Diagnosis dashboard. Windows are
+// parameterized through make_interval(days => $1) — never interval-string
+// concatenation — and every query is bounded (aggregate or LIMIT), so a
+// hostile ?days/?limit can at worst scan the clamped retention window.
+// ===========================================================================
+
+/**
+ * Headline numbers for the dashboard's stat cards, one window in one trip:
+ * agent impressions (intent pings), reconciled orders won (+ GMV/commission),
+ * and estimated revenue lost. Scalar subqueries instead of joins — the three
+ * tables aggregate independently and a join would multiply rows.
+ *
+ * @param {object} db
+ * @param {{windowDays: number}} options
+ * @returns {Promise<{impressions: number, orders_won: number, gmv: string,
+ *   commission: string, estimated_losses: string, losses: number}>}
+ */
+export async function getAnalyticsSummary(db, { windowDays }) {
+  const result = await db.query(
+    `SELECT
+       (SELECT count(*) FROM agent_intent_logs
+         WHERE processed_at >= now() - make_interval(days => $1))            AS impressions,
+       (SELECT count(*) FROM reconciled_agent_orders
+         WHERE reconciled_at >= now() - make_interval(days => $1))           AS orders_won,
+       (SELECT COALESCE(sum(gross_merchandise_value), 0) FROM reconciled_agent_orders
+         WHERE reconciled_at >= now() - make_interval(days => $1))           AS gmv,
+       (SELECT COALESCE(sum(commission_fee), 0) FROM reconciled_agent_orders
+         WHERE reconciled_at >= now() - make_interval(days => $1))           AS commission,
+       (SELECT count(*) FROM loss_diagnostics
+         WHERE created_at >= now() - make_interval(days => $1))              AS losses,
+       (SELECT COALESCE(sum(estimated_revenue_lost), 0) FROM loss_diagnostics
+         WHERE created_at >= now() - make_interval(days => $1))              AS estimated_losses`,
+    [windowDays]
+  );
+  const row = result.rows[0];
+  return {
+    impressions: Number(row.impressions),
+    orders_won: Number(row.orders_won),
+    gmv: String(row.gmv),
+    commission: String(row.commission),
+    losses: Number(row.losses),
+    estimated_losses: String(row.estimated_losses),
+  };
+}
+
+/**
+ * "Top reason for lost agent sales": loss counts + revenue by reason,
+ * biggest revenue impact first (what the merchant should fix first).
+ */
+export async function getLossReasonBreakdown(db, { windowDays }) {
+  const result = await db.query(
+    `SELECT calculated_loss_reason AS reason,
+            count(*)::bigint AS count,
+            COALESCE(sum(estimated_revenue_lost), 0) AS estimated_revenue_lost
+       FROM loss_diagnostics
+      WHERE created_at >= now() - make_interval(days => $1)
+      GROUP BY calculated_loss_reason
+      ORDER BY sum(estimated_revenue_lost) DESC, count(*) DESC`,
+    [windowDays]
+  );
+  return result.rows.map((row) => ({
+    reason: row.reason,
+    count: Number(row.count),
+    estimated_revenue_lost: String(row.estimated_revenue_lost),
+  }));
+}
+
+/**
+ * "Critical drop-off analysis": which endpoint phase the lost intents died
+ * in (/availability vs /shipping_quote), via the diagnostic's intent row.
+ */
+export async function getLossPhaseBreakdown(db, { windowDays }) {
+  const result = await db.query(
+    `SELECT i.endpoint_path AS phase, count(*)::bigint AS count
+       FROM loss_diagnostics d
+       JOIN agent_intent_logs i ON i.id = d.intent_log_id
+      WHERE d.created_at >= now() - make_interval(days => $1)
+      GROUP BY i.endpoint_path
+      ORDER BY count(*) DESC`,
+    [windowDays]
+  );
+  return result.rows.map((row) => ({ phase: row.phase, count: Number(row.count) }));
+}
+
+/**
+ * "Recent loss logs (live stream)": interleaved WON/LOST events, newest
+ * first. UNION ALL of the two outcome tables, each joined back to its intent
+ * for protocol/SKU context (orders reconciled on token alone fall back to
+ * their denormalized fields). The outer ORDER BY + LIMIT bounds the read.
+ */
+export async function getRecentActivity(db, { limit }) {
+  const result = await db.query(
+    `SELECT * FROM (
+        SELECT d.created_at                        AS occurred_at,
+               'LOST'                              AS outcome,
+               COALESCE(i.protocol_type, 'UNKNOWN_PROTOCOL') AS protocol,
+               d.target_sku                        AS target_sku,
+               d.calculated_loss_reason            AS detail,
+               d.estimated_revenue_lost::text      AS amount
+          FROM loss_diagnostics d
+          LEFT JOIN agent_intent_logs i ON i.id = d.intent_log_id
+        UNION ALL
+        SELECT r.reconciled_at                     AS occurred_at,
+               'WON'                               AS outcome,
+               COALESCE(i.protocol_type, 'UNKNOWN_PROTOCOL') AS protocol,
+               COALESCE(i.target_sku, 'UNSPECIFIED') AS target_sku,
+               'RECONCILED_ORDER'                  AS detail,
+               r.gross_merchandise_value::text     AS amount
+          FROM reconciled_agent_orders r
+          LEFT JOIN agent_intent_logs i ON i.id = r.intent_log_id
+     ) activity
+     ORDER BY occurred_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return result.rows;
+}
