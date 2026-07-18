@@ -127,6 +127,26 @@ export function loadConfig(env = process.env) {
     );
   }
 
+  // --- dashboard analytics (optional feature) ----------------------------
+  // DASHBOARD_API_TOKEN gates the read-only /analytics/* routes consumed by
+  // the merchant Loss Diagnosis dashboard. OPTIONAL by design: deployments
+  // that only run the write path (edge -> ingest -> DB) need no dashboard
+  // credential, and the analytics router answers 503 until one is set —
+  // an explicit "feature not configured" signal, never an auth bypass.
+  const dashboardTokenRaw = env.DASHBOARD_API_TOKEN;
+  const dashboardApiToken =
+    dashboardTokenRaw !== undefined && dashboardTokenRaw !== null && String(dashboardTokenRaw).trim() !== ''
+      ? String(dashboardTokenRaw).trim()
+      : null;
+
+  // CORS origin reflected on /analytics/* responses only (the dashboard SPA
+  // runs on a different origin in dev). '*' is acceptable because the routes
+  // are bearer-token-gated and carry no cookies; pin it in production.
+  const dashboardAllowedOrigin =
+    env.DASHBOARD_ALLOWED_ORIGIN !== undefined && String(env.DASHBOARD_ALLOWED_ORIGIN).trim() !== ''
+      ? String(env.DASHBOARD_ALLOWED_ORIGIN).trim()
+      : '*';
+
   return {
     databaseUrl: String(env.DATABASE_URL).trim(),
     ingestApiToken: String(env.INGEST_API_TOKEN).trim(),
@@ -134,5 +154,7 @@ export function loadConfig(env = process.env) {
     port,
     intentExpirySeconds,
     lossSweepIntervalMs,
+    dashboardApiToken,
+    dashboardAllowedOrigin,
   };
 }

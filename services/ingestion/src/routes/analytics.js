@@ -1,0 +1,149 @@
+/**
+ * routes/analytics.js — read-only API backing the Loss Diagnosis dashboard.
+ *
+ * Role in the AOP data flow:
+ *   [PostgreSQL: intent logs / reconciled orders / loss diagnostics]
+ *     --(repositories analytics reads)--> THIS ROUTER
+ *     --JSON--> [dashboard SPA: stat cards, drop-off analysis, loss tables]
+ *
+ * Endpoints (all GET, all bearer-gated by DASHBOARD_API_TOKEN):
+ *   /analytics/summary?days=7       stat-card numbers + conversion rate
+ *   /analytics/loss-reasons?days=7  ranked loss reasons with revenue + share
+ *   /analytics/activity?limit=50    interleaved WON/LOST live stream
+ *
+ * Security model:
+ *   - Read-only aggregates; no per-consumer PII exists downstream anyway
+ *     (redacted at the edge before storage).
+ *   - Bearer auth with the same timing-safe comparison as the ingest route,
+ *     but a SEPARATE credential: the dashboard must never hold the edge
+ *     pipeline's write token.
+ *   - When DASHBOARD_API_TOKEN is unset the feature is OFF: uniform 503 on
+ *     every route — an explicit "not configured" signal, never a bypass.
+ *   - CORS is enabled for config.dashboardAllowedOrigin (the SPA runs on a
+ *     different origin in dev). Token-gated + cookie-less, so reflecting a
+ *     wildcard origin leaks nothing that the token doesn't already gate.
+ */
+
+import express from 'express';
+import { timingSafeTokenCheck } from '../lib/auth.js';
+import { parseWindowDays, parseLimit, percentShare } from '../lib/analytics-params.js';
+import {
+  getAnalyticsSummary,
+  getLossReasonBreakdown,
+  getLossPhaseBreakdown,
+  getRecentActivity,
+} from '../repositories.js';
+
+/**
+ * Build the analytics router.
+ *
+ * @param {{config: object, db: object, logger: object}} deps
+ * @returns {express.Router}
+ */
+export function buildAnalyticsRouter({ config, db, logger }) {
+  const router = express.Router();
+
+  // ---- CORS (this router only; the write surface stays same-origin) ------
+  router.use((req, res, next) => {
+    res.set('Access-Control-Allow-Origin', config.dashboardAllowedOrigin);
+    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  // ---- feature gate + auth (uniform responses, no oracles) ---------------
+  router.use((req, res, next) => {
+    if (config.dashboardApiToken === null) {
+      res.status(503).json({ error: 'analytics disabled (DASHBOARD_API_TOKEN not configured)' });
+      return;
+    }
+    const match = /^Bearer\s+(.+)$/i.exec(req.get('authorization') ?? '');
+    const presented = match ? match[1].trim() : null;
+    if (!timingSafeTokenCheck(presented, config.dashboardApiToken)) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    next();
+  });
+
+  // ---- GET /analytics/summary --------------------------------------------
+  router.get('/summary', async (req, res, next) => {
+    try {
+      const windowDays = parseWindowDays(req.query.days);
+      const [summary, phases] = await Promise.all([
+        getAnalyticsSummary(db, { windowDays }),
+        getLossPhaseBreakdown(db, { windowDays }),
+      ]);
+
+      // Agent Conversion Rate: reconciled orders per intent impression —
+      // the metric headless merchants cannot compute anywhere else.
+      const conversionRatePct = percentShare(summary.orders_won, summary.impressions);
+
+      // "Critical drop-off": the phase where most losses died, with share.
+      const totalPhaseLosses = phases.reduce((sum, p) => sum + p.count, 0);
+      const topPhase = phases[0] ?? null;
+
+      res.json({
+        window_days: windowDays,
+        impressions: summary.impressions,
+        orders_won: summary.orders_won,
+        gmv: summary.gmv,
+        commission: summary.commission,
+        conversion_rate_pct: conversionRatePct,
+        losses: summary.losses,
+        estimated_losses: summary.estimated_losses,
+        critical_dropoff: topPhase
+          ? {
+              phase: topPhase.phase,
+              share_pct: percentShare(topPhase.count, totalPhaseLosses),
+              count: topPhase.count,
+            }
+          : null,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- GET /analytics/loss-reasons ---------------------------------------
+  router.get('/loss-reasons', async (req, res, next) => {
+    try {
+      const windowDays = parseWindowDays(req.query.days);
+      const reasons = await getLossReasonBreakdown(db, { windowDays });
+      const totalCount = reasons.reduce((sum, r) => sum + r.count, 0);
+      res.json({
+        window_days: windowDays,
+        total: totalCount,
+        reasons: reasons.map((r) => ({
+          ...r,
+          share_pct: percentShare(r.count, totalCount),
+        })),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- GET /analytics/activity -------------------------------------------
+  router.get('/activity', async (req, res, next) => {
+    try {
+      const limit = parseLimit(req.query.limit);
+      const events = await getRecentActivity(db, { limit });
+      res.json({ limit, events });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Log analytics failures with route context; the central handler answers.
+  router.use((err, req, res, next) => {
+    logger.error('analytics query failed', { err, path: req.path });
+    next(err);
+  });
+
+  return router;
+}
