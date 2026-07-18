@@ -75,7 +75,10 @@ retries, DLQ) with zero extra infrastructure.
 
 A stdlib-only HTTP wrapper around the scoring engine for the dashboard's Data
 Optimizer tab: `POST /score` returns the directive payload; `POST /rewrite`
-adds the Semantic Policy Rewriter artifact (`policy_jsonld`) — schema.org
+adds the Semantic Policy Rewriter artifact (`policy_jsonld`); `POST /simulate`
+runs the Pricing & Policy What-If Simulator (baseline plus counterfactual
+scenarios — extend returns, faster shipping, drop each penalty, free shipping,
+ceiling — each re-scored by the same engine so deltas are comparable) — schema.org
 `MerchantReturnPolicy` + `OfferShippingDetails` blocks for the policy as
 parsed ("current", an honest restatement) and with directive targets applied
 ("optimized"), plus `rewritten_policy_text`, agent-parseable prose that
@@ -88,8 +91,8 @@ The Loss Diagnosis screen from the product wireframe: stat cards (agent
 impressions, reconciled orders won + conversion rate, estimated losses), the
 critical drop-off callout, the ranked loss-reason table, and the polled
 WON/LOST live stream — all read from the ingestion service's bearer-gated
-`/analytics/*` routes. The Data Optimizer tab drives the optimizer
-microservice. Static build (Vite); connection settings live in the browser.
+`/analytics/*` routes. The Data Optimizer and What-If Simulator tabs drive the
+optimizer microservice's /rewrite and /simulate endpoints. Static build (Vite); connection settings live in the browser.
 
 ### The Relational Storage Layer (`db/` — PostgreSQL)
 
