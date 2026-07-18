@@ -1,0 +1,71 @@
+# =============================================================================
+# wrangler.toml — deployment config for the AOP edge proxy Cloudflare Worker.
+#
+# Role in the AOP data flow:
+#   [AI Agent] -> [THIS WORKER (aop-edge-proxy)] -> (sync passthrough) -> [Shopify origin]
+#                        |
+#                        +--> telemetry -> [EDGE_LOG_QUEUE / "aop-edge-telemetry"]
+#                                              |
+#                                              +--> queue() consumer (same worker)
+#                                                       -> HTTPS POST -> AOP ingestion service
+#
+# The same worker script is BOTH the queue producer (fetch handler pushes intent
+# telemetry records) and the queue consumer (queue handler batches records and
+# forwards them to the Node.js ingestion service, which writes to PostgreSQL).
+# =============================================================================
+
+name = "aop-edge-proxy"
+main = "src/index.js"
+
+# Pin runtime behavior. Bump deliberately; never let an implicit runtime change
+# alter proxy semantics for live merchant traffic.
+compatibility_date = "2026-07-01"
+
+# -----------------------------------------------------------------------------
+# Queue producer: the fetch() handler pushes one telemetry record per intercepted
+# intent request via env.EDGE_LOG_QUEUE.send(record). Producing is fire-and-forget
+# inside ctx.waitUntil() so a queue outage can never slow or break live traffic.
+# -----------------------------------------------------------------------------
+[[queues.producers]]
+binding = "EDGE_LOG_QUEUE"
+queue = "aop-edge-telemetry"
+
+# -----------------------------------------------------------------------------
+# Queue consumer: the queue() handler drains "aop-edge-telemetry" and POSTs
+# batches to the ingestion service.
+#   max_batch_size 100 / max_batch_timeout 5s -> at most 100 records or 5 seconds
+#     of buffering per ingest POST, balancing ingest-service load vs. freshness
+#     (well inside the 60-second intent-expiry sweep window downstream).
+#   max_retries + dead_letter_queue -> failed batches are redelivered by Queues;
+#     after 5 failed attempts messages land in "aop-edge-telemetry-dlq" so poison
+#     messages can be inspected/replayed instead of blocking the pipeline.
+# -----------------------------------------------------------------------------
+[[queues.consumers]]
+queue = "aop-edge-telemetry"
+max_batch_size = 100
+max_batch_timeout = 5
+max_retries = 5
+dead_letter_queue = "aop-edge-telemetry-dlq"
+
+# -----------------------------------------------------------------------------
+# Plain-text configuration vars (readable in the dashboard; NOT for secrets).
+# -----------------------------------------------------------------------------
+[vars]
+# MERCHANT_ROUTES: JSON string mapping an incoming proxy hostname to the merchant
+# origin base URL the worker forwards to. The origin hostname is also recorded as
+# shop_domain in telemetry, which the ingestion service maps to a merchant_id.
+MERCHANT_ROUTES = '{"agents.redthread.aop.network":"https://redthreadapparel.com"}'
+
+# DEFAULT_ORIGIN: fallback origin used when the incoming hostname has no entry in
+# MERCHANT_ROUTES. Leave empty ("") to hard-fail unknown hostnames with a 502
+# instead of proxying somewhere unintended (and to guarantee we never loop back
+# to ourselves).
+DEFAULT_ORIGIN = ""
+
+# INGEST_API_URL: base URL of the AOP Node.js ingestion service. The queue
+# consumer POSTs batches to INGEST_API_URL + "/ingest/telemetry".
+INGEST_API_URL = "https://ingest.aop.network"
+
+# INGEST_API_TOKEN is a SECRET — never put it in [vars]. Provision it with:
+#   wrangler secret put INGEST_API_TOKEN
+# The queue consumer sends it as "Authorization: Bearer <token>" on ingest POSTs.
