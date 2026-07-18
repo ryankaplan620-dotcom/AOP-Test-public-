@@ -1,0 +1,165 @@
+# =============================================================================
+# AOP continuous integration.
+#
+# One job per component, matching the repo layout and the exact test commands
+# documented in each component's README / package.json:
+#   - edge        : Cloudflare Worker — plain Node, no deps, no network
+#   - ingestion   : Node.js/Express service — pure-module test suite
+#   - optimizer   : Python stdlib engine — unittest + CLI smoke
+#   - db          : migrations applied against a real PostgreSQL 16 service
+#
+# All jobs run on every push and pull request targeting main. They are the
+# merge gate for the PR.
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so a rapid push sequence doesn't
+# queue redundant CI.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  edge:
+    name: edge — Cloudflare Worker proxy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # No install: the worker has zero runtime deps and the suite runs on
+      # plain Node (env/ctx stubbed, globalThis.fetch monkeypatched).
+      - name: Syntax check
+        working-directory: edge
+        run: find src -name '*.js' -exec node --check {} \;
+      - name: Test
+        working-directory: edge
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  ingestion:
+    name: ingestion — attribution service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: services/ingestion/package-lock.json
+      - name: Install
+        working-directory: services/ingestion
+        run: npm ci
+      # Syntax-check EVERY source file (routes/app/index are not imported by the
+      # pure test suite, so this is what catches syntax errors in them).
+      - name: Syntax check
+        working-directory: services/ingestion
+        run: find src -name '*.js' -exec node --check {} \;
+      - name: Test
+        working-directory: services/ingestion
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  optimizer:
+    name: optimizer — policy scoring engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      # Stdlib only — nothing to install.
+      - name: Test
+        working-directory: optimizer
+        run: python -m unittest discover -v
+      - name: CLI smoke
+        working-directory: optimizer
+        run: |
+          echo "We charge a 15% restocking fee. Returns within 14 days for store credit only. Ships in 4-6 business days." \
+            | python -m aop_optimizer --pretty
+
+  # ---------------------------------------------------------------------------
+  db:
+    name: db — migrations (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: aop
+          POSTGRES_PASSWORD: aop
+          POSTGRES_DB: aop
+        ports:
+          - 5432:5432
+        # Wait until the server accepts connections before the job's steps run.
+        options: >-
+          --health-cmd "pg_isready -U aop -d aop"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://aop:aop@localhost:5432/aop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: db/package-lock.json
+      - name: Runner syntax check
+        working-directory: db
+        run: node --check migrate.mjs
+      - name: Install
+        working-directory: db
+        run: npm ci
+      - name: Apply migrations
+        working-directory: db
+        run: npm run migrate
+      - name: Idempotency — second run must no-op
+        working-directory: db
+        run: npm run migrate
+      - name: Verify generated commission column
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO merchant_profiles (shopify_shop_domain, access_token_encrypted)
+            VALUES ('ci.example.com', 'enc:ci');
+          INSERT INTO reconciled_agent_orders
+            (merchant_id, shopify_order_id, transaction_token, gross_merchandise_value)
+            SELECT id, 'ci-order-1', 'tok_ci', 1234.56 FROM merchant_profiles
+             WHERE shopify_shop_domain = 'ci.example.com';
+          -- 1234.56 * 0.005 = 6.1728 -> round(,2) = 6.17 (billing math is the
+          -- schema's generated column, not app code).
+          DO $$
+          DECLARE fee numeric;
+          BEGIN
+            SELECT commission_fee INTO fee FROM reconciled_agent_orders
+             WHERE shopify_order_id = 'ci-order-1';
+            IF fee <> 6.17 THEN
+              RAISE EXCEPTION 'commission_fee % != expected 6.17', fee;
+            END IF;
+            RAISE NOTICE 'generated commission_fee = % (ok)', fee;
+          END $$;
+          -- commission_rate > 1 must be rejected by the CHECK bound.
+          DO $$
+          BEGIN
+            INSERT INTO reconciled_agent_orders
+              (merchant_id, shopify_order_id, transaction_token,
+               gross_merchandise_value, commission_rate)
+              SELECT id, 'ci-order-bad', 'tok_ci', 100, 5.0 FROM merchant_profiles
+               WHERE shopify_shop_domain = 'ci.example.com';
+            RAISE EXCEPTION 'commission_rate bound NOT enforced';
+          EXCEPTION WHEN check_violation THEN
+            RAISE NOTICE 'commission_rate bound enforced (ok)';
+          END $$;
+          SQL
