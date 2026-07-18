@@ -14,6 +14,11 @@ admin panel") exposes exactly two POST endpoints:
     POST /rewrite  same request body
                    -> directive payload + "policy_jsonld" (current/optimized
                       schema.org blocks + rewritten_policy_text)
+    POST /simulate same request body
+                   -> the Pricing & Policy What-If Simulator: baseline score
+                      plus counterfactual scenarios (extend returns, faster
+                      shipping, drop each penalty, free shipping, ceiling),
+                      each with score/probability deltas
     GET  /healthz  -> {"status": "ok"} liveness probe
 
 Design constraints:
@@ -42,6 +47,7 @@ from .directives import build_directive_payload
 from .jsonld import build_policy_jsonld
 from .scoring import AgentOptimizationEngine
 from .semantics import parse_policy_semantics
+from .simulator import simulate_variations
 
 #: Hard cap on accepted request bodies. Policy text is a few KB; anything
 #: beyond this is a mistake or abuse, not a policy.
@@ -63,6 +69,16 @@ def _run_pipeline(policy_text: str, baseline: float, temperature: float, with_js
     if with_jsonld:
         payload["policy_jsonld"] = build_policy_jsonld(metrics, report)
     return payload
+
+
+def _run_simulation(policy_text: str, baseline: float, temperature: float) -> Dict[str, Any]:
+    """What-if pass: same parse + engine config, counterfactual variations."""
+    metrics = parse_policy_semantics(policy_text)
+    engine = AgentOptimizationEngine(
+        market_baseline_score=baseline,
+        probability_temperature=temperature,
+    )
+    return simulate_variations(metrics, engine)
 
 
 def _parse_request(body: bytes) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -145,7 +161,7 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in ("/score", "/rewrite"):
+        if self.path not in ("/score", "/rewrite", "/simulate"):
             self._send_json(404, {"error": "not found"})
             return
         body = self._read_body()
@@ -156,12 +172,17 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": error})
             return
         try:
-            payload = _run_pipeline(
-                params["policy_text"],
-                params["baseline"],
-                params["temperature"],
-                with_jsonld=(self.path == "/rewrite"),
-            )
+            if self.path == "/simulate":
+                payload = _run_simulation(
+                    params["policy_text"], params["baseline"], params["temperature"]
+                )
+            else:
+                payload = _run_pipeline(
+                    params["policy_text"],
+                    params["baseline"],
+                    params["temperature"],
+                    with_jsonld=(self.path == "/rewrite"),
+                )
         except Exception as exc:  # pragma: no cover — pipeline is non-raising
             # The engine contract is non-raising, but an HTTP wrapper must
             # never crash the worker thread on a surprise.

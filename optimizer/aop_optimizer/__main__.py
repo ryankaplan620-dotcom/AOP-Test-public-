@@ -44,6 +44,7 @@ from typing import List, Optional
 
 from .directives import build_directive_payload
 from .jsonld import build_policy_jsonld
+from .simulator import simulate_variations
 from .scoring import AgentOptimizationEngine
 from .semantics import parse_policy_semantics
 
@@ -97,6 +98,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "include the Semantic Policy Rewriter artifact (schema.org "
             "JSON-LD for the current and optimized policy plus the "
             "agent-parseable rewritten text) under 'policy_jsonld'"
+        ),
+    )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help=(
+            "output the Pricing & Policy What-If Simulator instead of the "
+            "directive payload: baseline score plus counterfactual scenarios "
+            "(extend returns, faster shipping, drop penalties, free shipping) "
+            "each with score/probability deltas"
         ),
     )
     return parser
@@ -166,12 +177,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             market_baseline_score=args.baseline,
             probability_temperature=args.temperature,
         )
-        report = engine.evaluate(metrics)
-        payload = build_directive_payload(metrics, report)
-        if args.jsonld:
-            # Sprint 6 lever: attach the structured-data rewrite artifact so
-            # one CLI call yields both the diagnosis and the fix.
-            payload["policy_jsonld"] = build_policy_jsonld(metrics, report)
+        if args.simulate:
+            # What-if mode: the engine is reused for every counterfactual so
+            # scenario deltas are comparable to the baseline.
+            payload = simulate_variations(metrics, engine)
+        else:
+            report = engine.evaluate(metrics)
+            payload = build_directive_payload(metrics, report)
+            if args.jsonld:
+                # Sprint 6 lever: attach the structured-data rewrite artifact
+                # so one CLI call yields both the diagnosis and the fix.
+                payload["policy_jsonld"] = build_policy_jsonld(metrics, report)
         print(json.dumps(payload, indent=2 if args.pretty else None))
         return EXIT_OK
     except Exception as exc:  # pragma: no cover - pipeline is non-raising

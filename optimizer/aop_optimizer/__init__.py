@@ -38,6 +38,7 @@ Or from the command line:  python3 -m aop_optimizer --file policy.txt --pretty
 
 from .directives import SCHEMA_VERSION, build_directive_payload
 from .scoring import AgentOptimizationEngine, Deduction, ScoreReport
+from .simulator import simulate_variations
 from .semantics import (
     DEFAULT_SHIPPING_DAYS,
     HiddenPenaltyTerm,
@@ -59,5 +60,6 @@ __all__ = [
     "ScoreReport",
     "build_directive_payload",
     "parse_policy_semantics",
+    "simulate_variations",
     "__version__",
 ]

@@ -104,5 +104,26 @@ class ServerTestCase(unittest.TestCase):
             self.assertIn("POST", response.headers.get("Access-Control-Allow-Methods", ""))
 
 
+    # ------------------------------------------------------- what-if simulator
+    def test_simulate_returns_baseline_and_scenarios(self):
+        status, payload, _ = self._post(
+            "/simulate",
+            {"policy_text": "15% restocking fee. Returns within 14 days. Ships in 4-6 business days."},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("baseline", payload)
+        self.assertIn("agent_match_score", payload["baseline"])
+        codes = [s["code"] for s in payload["scenarios"]]
+        self.assertIn("REMOVE_RESTOCKING_FEE", codes)
+        self.assertEqual(codes[-1], "FULLY_OPTIMIZED")
+        for scenario in payload["scenarios"]:
+            self.assertGreaterEqual(scenario["score_delta"], 0)
+
+    def test_simulate_validates_like_the_other_endpoints(self):
+        status, payload, _ = self._post("/simulate", {"policy_text": "  "})
+        self.assertEqual(status, 400)
+        self.assertIn("policy_text", payload["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
