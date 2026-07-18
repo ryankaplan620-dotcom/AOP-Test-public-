@@ -1,0 +1,5 @@
+# AOP ingestion service — local artifacts that must never enter the repo.
+node_modules/
+*.log
+.env
+.env.*
