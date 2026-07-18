@@ -1,0 +1,136 @@
+/* styles.css — AOP merchant dashboard.
+ *
+ * Layout mirrors the product wireframe ("Agent Loss Diagnosis Screen"):
+ * top bar, tab nav, three stat cards, critical drop-off callout, loss-reason
+ * table, live WON/LOST stream. One hand-rolled stylesheet — no CSS framework
+ * — to keep the SPA dependency surface at exactly react + react-dom. */
+
+:root {
+  --bg: #0f1420;
+  --panel: #171e2e;
+  --panel-edge: #232d44;
+  --text: #e8ecf5;
+  --muted: #8b96ad;
+  --accent: #4f8cff;
+  --won: #3ecf8e;
+  --lost: #ff6b6b;
+  --warn: #ffb454;
+  font-size: 15px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "SF Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
+  line-height: 1.45;
+}
+
+#root { max-width: 1080px; margin: 0 auto; padding: 0 20px 60px; }
+
+/* ---- header + tabs ------------------------------------------------------ */
+.topbar {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 18px 0 10px; border-bottom: 1px solid var(--panel-edge);
+}
+.topbar .brand { font-weight: 700; letter-spacing: 0.5px; }
+.topbar .brand span { color: var(--accent); }
+.topbar .store { color: var(--muted); font-size: 0.85rem; }
+
+.tabs { display: flex; gap: 4px; margin: 14px 0 22px; flex-wrap: wrap; }
+.tabs button {
+  background: none; border: 1px solid var(--panel-edge); color: var(--muted);
+  padding: 7px 14px; cursor: pointer; font: inherit; border-radius: 6px;
+}
+.tabs button.active { color: var(--text); border-color: var(--accent); background: var(--panel); }
+.tabs button:hover { color: var(--text); }
+
+/* ---- shared panels ------------------------------------------------------ */
+.panel {
+  background: var(--panel); border: 1px solid var(--panel-edge);
+  border-radius: 8px; padding: 16px 18px; margin-bottom: 18px;
+}
+.panel h2 {
+  margin: 0 0 4px; font-size: 0.95rem; text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.panel .sub { color: var(--muted); font-size: 0.82rem; margin: 0 0 14px; }
+
+.error-banner {
+  background: rgba(255, 107, 107, 0.12); border: 1px solid var(--lost);
+  color: var(--lost); border-radius: 8px; padding: 10px 14px; margin-bottom: 18px;
+  font-size: 0.85rem;
+}
+
+.controls { display: flex; gap: 10px; align-items: center; margin-bottom: 18px; }
+.controls label { color: var(--muted); font-size: 0.82rem; }
+.controls select {
+  background: var(--panel); color: var(--text); border: 1px solid var(--panel-edge);
+  padding: 5px 8px; border-radius: 6px; font: inherit;
+}
+
+/* ---- stat cards --------------------------------------------------------- */
+.stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px; }
+@media (max-width: 760px) { .stat-grid { grid-template-columns: 1fr; } }
+.stat {
+  background: var(--panel); border: 1px solid var(--panel-edge);
+  border-radius: 8px; padding: 14px 16px;
+}
+.stat .label { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 1px; }
+.stat .value { font-size: 1.7rem; font-weight: 700; margin: 6px 0 4px; }
+.stat .note { font-size: 0.78rem; color: var(--muted); }
+.stat.losses .value { color: var(--lost); }
+
+/* ---- drop-off callout --------------------------------------------------- */
+.dropoff { border-left: 4px solid var(--warn); }
+.dropoff .headline { color: var(--warn); font-weight: 700; }
+
+/* ---- tables ------------------------------------------------------------- */
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--panel-edge); }
+th { color: var(--muted); font-weight: 400; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 1px; }
+td.num, th.num { text-align: right; }
+.outcome-WON { color: var(--won); font-weight: 700; }
+.outcome-LOST { color: var(--lost); font-weight: 700; }
+.share-bar { background: var(--panel-edge); height: 6px; border-radius: 3px; overflow: hidden; }
+.share-bar > div { background: var(--accent); height: 100%; }
+
+/* ---- optimizer panel ---------------------------------------------------- */
+textarea {
+  width: 100%; min-height: 130px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--panel-edge); border-radius: 6px; padding: 10px;
+  font: inherit; resize: vertical;
+}
+.btn {
+  background: var(--accent); color: #fff; border: none; border-radius: 6px;
+  padding: 9px 18px; font: inherit; font-weight: 700; cursor: pointer; margin-top: 10px;
+}
+.btn:disabled { opacity: 0.5; cursor: wait; }
+.score-row { display: flex; gap: 24px; align-items: baseline; margin: 16px 0 6px; }
+.score-big { font-size: 2.4rem; font-weight: 700; }
+.score-good { color: var(--won); }
+.score-mid { color: var(--warn); }
+.score-bad { color: var(--lost); }
+pre.jsonld {
+  background: var(--bg); border: 1px solid var(--panel-edge); border-radius: 6px;
+  padding: 12px; overflow-x: auto; font-size: 0.78rem; max-height: 320px;
+}
+.rewrite-text {
+  background: rgba(62, 207, 142, 0.08); border: 1px solid var(--won);
+  border-radius: 6px; padding: 12px; font-size: 0.88rem;
+}
+.directive { border-left: 3px solid var(--accent); padding: 6px 12px; margin: 8px 0; font-size: 0.85rem; }
+.directive .gain { color: var(--won); }
+
+/* ---- settings ----------------------------------------------------------- */
+.settings-grid { display: grid; gap: 12px; max-width: 560px; }
+.settings-grid label { display: grid; gap: 4px; font-size: 0.82rem; color: var(--muted); }
+.settings-grid input {
+  background: var(--bg); color: var(--text); border: 1px solid var(--panel-edge);
+  border-radius: 6px; padding: 8px 10px; font: inherit;
+}
+.saved-note { color: var(--won); font-size: 0.8rem; margin-left: 12px; }
+
+.footnote { color: var(--muted); font-size: 0.75rem; margin-top: 26px; }
