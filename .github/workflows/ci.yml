@@ -83,11 +83,32 @@ jobs:
       - name: Test
         working-directory: optimizer
         run: python -m unittest discover -v
-      - name: CLI smoke
+      - name: CLI smoke (incl. Semantic Policy Rewriter artifact)
         working-directory: optimizer
         run: |
           echo "We charge a 15% restocking fee. Returns within 14 days for store credit only. Ships in 4-6 business days." \
-            | python -m aop_optimizer --pretty
+            | python -m aop_optimizer --pretty --jsonld
+
+  # ---------------------------------------------------------------------------
+  dashboard:
+    name: dashboard — Loss Diagnosis SPA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: Install
+        working-directory: dashboard
+        run: npm ci
+      - name: Test (pure formatting helpers)
+        working-directory: dashboard
+        run: npm test
+      - name: Build
+        working-directory: dashboard
+        run: npm run build
 
   # ---------------------------------------------------------------------------
   db:

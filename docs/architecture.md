@@ -71,6 +71,26 @@ retries, DLQ) with zero extra infrastructure.
   and no existing diagnostic, classifies each (`lib/loss-classifier.js`), and
   writes `loss_diagnostics` rows. Per-row error isolation; overlap guard.
 
+### The Optimizer Microservice (`optimizer/aop_optimizer/server.py`)
+
+A stdlib-only HTTP wrapper around the scoring engine for the dashboard's Data
+Optimizer tab: `POST /score` returns the directive payload; `POST /rewrite`
+adds the Semantic Policy Rewriter artifact (`policy_jsonld`) — schema.org
+`MerchantReturnPolicy` + `OfferShippingDetails` blocks for the policy as
+parsed ("current", an honest restatement) and with directive targets applied
+("optimized"), plus `rewritten_policy_text`, agent-parseable prose that
+round-trips through our own parser to a score of 100 (tested). Binds
+127.0.0.1 by default; expected to sit behind the merchant app's auth.
+
+### The Merchant Dashboard (`dashboard/` — React SPA)
+
+The Loss Diagnosis screen from the product wireframe: stat cards (agent
+impressions, reconciled orders won + conversion rate, estimated losses), the
+critical drop-off callout, the ranked loss-reason table, and the polled
+WON/LOST live stream — all read from the ingestion service's bearer-gated
+`/analytics/*` routes. The Data Optimizer tab drives the optimizer
+microservice. Static build (Vite); connection settings live in the browser.
+
 ### The Relational Storage Layer (`db/` — PostgreSQL)
 
 Migrations `0001`–`0006`, applied by `db/migrate.mjs` (advisory-locked,
