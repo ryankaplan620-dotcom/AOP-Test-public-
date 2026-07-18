@@ -66,19 +66,28 @@ export async function insertIntentLogsBatch(db, rows) {
   if (!Array.isArray(rows) || rows.length === 0) return 0;
 
   const params = [];
-  const valueGroups = rows.map((row) => {
+  const valueGroups = rows.map((row, index) => {
     // Payload is stringified HERE (not left to the driver): node-postgres
     // would serialize a JS array parameter as a Postgres array literal, not
     // JSON — the explicit ::jsonb cast on a JSON string is unambiguous.
     const payloadJson = row.payload === null || row.payload === undefined ? null : JSON.stringify(row.payload);
-    params.push(row.merchantId, row.token, row.protocol, row.method, row.path, row.targetSku, payloadJson);
-    const base = params.length - INTENT_LOG_COLUMNS.length;
-    // Placeholders only — e.g. "($1, $2, $3, $4, $5, $6, $7::jsonb)".
-    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::jsonb)`;
+    params.push(row.merchantId, row.token, row.protocol, row.method, row.path, row.targetSku, payloadJson, index);
+    const base = params.length - (INTENT_LOG_COLUMNS.length + 1);
+    // Placeholders only. processed_at = now() + batch-position microseconds:
+    // every row of a multi-row INSERT shares the transaction's now(), which
+    // would make same-token probes in one batch (availability then
+    // shipping_quote) mutually "not newer" — the loss sweep and attribution
+    // stitch both order by processed_at, and "which probe came last" must
+    // follow queue arrival order, not a random-UUID tie-break. One µs per
+    // position is far below any real inter-probe gap and preserves order.
+    return (
+      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::jsonb, ` +
+      `now() + make_interval(secs => $${base + 8}::float8 / 1e6))`
+    );
   });
 
   const result = await db.query(
-    `INSERT INTO agent_intent_logs (${INTENT_LOG_COLUMNS.join(', ')})
+    `INSERT INTO agent_intent_logs (${INTENT_LOG_COLUMNS.join(', ')}, processed_at)
      VALUES ${valueGroups.join(', ')}`,
     params
   );
@@ -116,7 +125,7 @@ export async function findLatestIntentByToken(db, merchantId, transactionToken) 
         AND NOT EXISTS (
               SELECT 1 FROM reconciled_agent_orders r
                WHERE r.intent_log_id = i.id)
-      ORDER BY i.processed_at DESC
+      ORDER BY i.processed_at DESC, i.id DESC
       LIMIT 1`,
     [merchantId, transactionToken]
   );
@@ -183,7 +192,7 @@ export async function insertReconciledOrder(db, { merchantId, intentLogId, shopi
  * The sweep query: intents whose conversion window has expired and that
  * neither converted nor were already diagnosed.
  *
- * Anti-join construction (NOT EXISTS x3, all index-backed):
+ * Anti-join construction (NOT EXISTS x4, all index-backed):
  *   - no reconciled order referencing the intent row directly (intent_log_id),
  *   - no reconciled order matching the intent's token FOR THE SAME MERCHANT
  *     (token matching is how late webhooks reconcile; merchant scoping stops
@@ -191,7 +200,18 @@ export async function insertReconciledOrder(db, { merchantId, intentLogId, shopi
  *   - no existing loss_diagnostics row (idempotency: re-scanning a window
  *     after a crash must not re-fetch already-diagnosed intents; the UNIQUE
  *     constraint on loss_diagnostics.intent_log_id is the schema-level
- *     backstop for the race where two sweeps interleave anyway).
+ *     backstop for the race where two sweeps interleave anyway),
+ *   - no NEWER intent with the same token for the same merchant: one agent
+ *     session legitimately spans several probes (/availability then
+ *     /shipping_quote) under one token, and diagnosing every probe would
+ *     double-count a single abandoned session and mis-attribute the
+ *     drop-off phase. Only the session's LAST probe — the phase the agent
+ *     actually walked away from — earns the diagnostic; earlier probes of a
+ *     diagnosed session are never selected (they always fail this check).
+ *     Tie-break on (processed_at, id): probes of one session batched into a
+ *     single multi-row INSERT share the transaction's now(), so timestamp
+ *     alone cannot order them; the row-tuple comparison guarantees exactly
+ *     one winner per token either way.
  *
  * make_interval(secs => $1) keeps the expiry window parameterized — no
  * interval string concatenation.
@@ -220,6 +240,11 @@ export async function findExpiredUnreconciledIntents(db, { expirySeconds, limit 
         AND NOT EXISTS (
               SELECT 1 FROM loss_diagnostics d
                WHERE d.intent_log_id = i.id)
+        AND NOT EXISTS (
+              SELECT 1 FROM agent_intent_logs newer
+               WHERE newer.merchant_id = i.merchant_id
+                 AND newer.transaction_token = i.transaction_token
+                 AND (newer.processed_at, newer.id) > (i.processed_at, i.id))
       ORDER BY i.processed_at ASC
       LIMIT $2`,
     [expirySeconds, limit]
