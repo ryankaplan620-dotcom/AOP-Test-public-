@@ -112,3 +112,11 @@ export function rewritePolicy(settings, policyText) {
     body: { policy_text: policyText },
   });
 }
+
+/** What-if pass: baseline + counterfactual scenarios with score/prob deltas. */
+export function simulatePolicy(settings, policyText) {
+  return request(`${baseOf(settings.optimizerUrl)}/simulate`, {
+    method: 'POST',
+    body: { policy_text: policyText },
+  });
+}
