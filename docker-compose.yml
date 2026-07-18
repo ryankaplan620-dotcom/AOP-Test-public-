@@ -1,0 +1,60 @@
+# =============================================================================
+# AOP local development stack.
+#
+# Brings up the Relational Storage Layer (PostgreSQL 16). The ingestion service
+# and edge worker run on the host during development (npm start / wrangler dev)
+# so code reloads stay instant; a containerized ingestion block is sketched
+# below for parity testing.
+#
+#   cp .env.example .env
+#   docker compose up -d postgres
+#   cd db && DATABASE_URL=postgres://aop:aop@localhost:5432/aop npm run migrate
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aop-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aop}
+      POSTGRES_DB: ${POSTGRES_DB:-aop}
+    ports:
+      - "5432:5432"
+    volumes:
+      - aop-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready exits 0 only once the server accepts connections — compose
+      # dependents (and humans) get a real readiness signal, not just "started".
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aop} -d ${POSTGRES_DB:-aop}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Containerized ingestion service — disabled by default (run it on the host
+  # with `npm start` during development). To enable: uncomment, then
+  # `docker compose up -d ingestion`. Requires the migrations to have been run.
+  # ---------------------------------------------------------------------------
+  # ingestion:
+  #   image: node:22-alpine
+  #   container_name: aop-ingestion
+  #   working_dir: /app
+  #   command: sh -c "npm install --omit=dev && npm start"
+  #   volumes:
+  #     - ./services/ingestion:/app
+  #   environment:
+  #     DATABASE_URL: postgres://${POSTGRES_USER:-aop}:${POSTGRES_PASSWORD:-aop}@postgres:5432/${POSTGRES_DB:-aop}
+  #     INGEST_API_TOKEN: ${INGEST_API_TOKEN:?set in .env}
+  #     SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:?set in .env}
+  #     PORT: "8787"
+  #   ports:
+  #     - "8787:8787"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   restart: unless-stopped
+
+volumes:
+  aop-pgdata:

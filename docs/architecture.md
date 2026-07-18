@@ -1,0 +1,151 @@
+# AOP Technical Architecture
+
+## 1. High-level topology
+
+The platform runs on a decentralized edge model so the telemetry proxy adds fewer
+than 5 milliseconds of latency to storefront lookups:
+
+```
+[ AI Agent Client ]
+        │
+        │ (HTTPS Request to Proxy URL)
+        ▼
+[ Cloudflare Workers Edge Node ]  ── edge/src/index.js
+        ├─── (Asynchronous Log Pipe) ───► [ Cloudflare Queue: aop-edge-telemetry ]
+        │                                             │
+        │ (Synchronous Pass-Through)                  ▼
+        ▼                                   [ Worker Ingestion Engine ]
+[ Shopify API Gateways ]                    services/ingestion (Express)
+        │                                             │
+        │ (Webhook: Order Placed)                     ▼
+        ▼                                   [ PostgreSQL Core Database ]
+[ Webhook Receiver Engine ] ──────────────────────────┘
+services/ingestion/src/routes/webhooks.js   (Attribution Stitching)
+```
+
+## 2. Component responsibilities
+
+### The Ingestion Edge (`edge/` — Cloudflare Workers)
+
+One worker script exports two handlers:
+
+- **`fetch(request, env, ctx)`** — the live proxy. The only synchronous work
+  before dispatching to the merchant origin: URL parse, two header reads, origin
+  resolution (memoized `MERCHANT_ROUTES` lookup), `request.clone()`. Everything
+  else — bounded 32KB body capture, JSON parse, **PII redaction**, record build,
+  `EDGE_LOG_QUEUE.send()` — is deferred into `ctx.waitUntil()` and runs after the
+  response is already streaming back to the agent. Telemetry failure can never
+  alter merchant traffic (double-contained try/catch, plus a final backstop that
+  converts any unexpected error to a structured 502/500 JSON response).
+- **`queue(batch, env)`** — the drain. Batches of up to 100 records (or 5s of
+  buffering) are POSTed to the ingestion service with a bearer token. 2xx acks
+  the batch; anything else retries via Queues redelivery, with poison batches
+  parked in `aop-edge-telemetry-dlq` after 5 attempts.
+
+Only `/availability` and `/shipping_quote` (exact or final path segment) produce
+telemetry; **all** paths are transparently proxied either way. The origin URL is
+built by assigning `pathname`/`search` onto the configured origin — never by
+resolving the inbound path against it — so a hostile `//host` path can't turn the
+worker into an open proxy.
+
+### The Queue Broker (Cloudflare Queues)
+
+High-throughput buffer between the edge and the database, protecting PostgreSQL
+from lock pressure during traffic spikes or scraper runs. The product spec's
+Redis Enterprise role is fulfilled by Cloudflare Queues in this MVP: it is
+native to the Worker runtime (`.send()` producer binding, batch consumer,
+retries, DLQ) with zero extra infrastructure.
+
+### The Worker Ingestion Engine (`services/ingestion/` — Node.js/Express)
+
+- `POST /ingest/telemetry` — bearer-auth (timing-safe), per-record validation
+  (`lib/validate-telemetry.js` repairs what is safe, rejects what would corrupt
+  attribution), shop-domain → merchant resolution through a 60s TTL cache, one
+  multi-row parameterized INSERT per batch.
+- `POST /webhooks/shopify/orders-create` — the Webhook Receiver Engine. Raw-body
+  HMAC-SHA256 verification (mounted before any JSON parser — Shopify signs the
+  exact bytes), token extraction from `note_attributes`, attribution stitch,
+  idempotent reconciled-order INSERT.
+- `jobs/loss-sweep.js` — every 15s (default), finds intents older than the
+  60-second conversion window with no reconciled order (by intent id or token)
+  and no existing diagnostic, classifies each (`lib/loss-classifier.js`), and
+  writes `loss_diagnostics` rows. Per-row error isolation; overlap guard.
+
+### The Relational Storage Layer (`db/` — PostgreSQL)
+
+Migrations `0001`–`0006`, applied by `db/migrate.mjs` (advisory-locked,
+transaction-per-file, tracked in `schema_migrations`).
+
+## 3. The attribution-stitching sequence
+
+1. **Intent ping** — agent probes `/availability?sku=X` with
+   `X-Agent-Transaction-Token: tok_123`. Edge logs a record; ingestion writes an
+   `agent_intent_logs` row.
+2. **Checkout** *(happy path)* — the agent completes checkout; the order carries
+   `aop_transaction_token = tok_123` in `note_attributes`. Shopify fires
+   `orders/create`; the webhook receiver verifies HMAC, finds the **latest
+   unclaimed** intent with that token for that merchant, and inserts a
+   `reconciled_agent_orders` row. The DB computes `commission_fee` as
+   `round(gmv * commission_rate, 2)` in a stored generated column
+   (`commission_rate` snapshotted per-row at 0.5%).
+3. **Expiry** *(loss path)* — no matching order arrives within
+   `INTENT_EXPIRY_SECONDS` (60s). The sweep classifies the drop-off from the
+   intent's payload/status evidence and writes exactly one `loss_diagnostics`
+   row (`intent_log_id` is UNIQUE).
+
+Attribution invariants, all schema-enforced:
+
+- one order per intent (`UNIQUE` index on `reconciled_agent_orders.intent_log_id`;
+  token-reuse and webhook races degrade to token-alone reconciliation with a
+  `NULL` intent pointer — the billable order is never dropped);
+- one diagnostic per intent (`UNIQUE` on `loss_diagnostics.intent_log_id`);
+- no double-billing on webhook redelivery (`UNIQUE` on `shopify_order_id` +
+  `ON CONFLICT DO NOTHING`);
+- billing survives telemetry pruning (`intent_log_id ON DELETE SET NULL` and a
+  denormalized `transaction_token` copy on the order row).
+
+## 4. Commission model
+
+`reconciled_agent_orders` is the billing source of truth:
+
+- `gross_merchandise_value NUMERIC(12,2)` — the order total from the webhook.
+- `commission_rate NUMERIC(6,5)` — per-row snapshot, default `0.00500`,
+  CHECK-bounded to `[0, 1]` so a fat-fingered rate can't mint a fee larger than
+  the order.
+- `commission_fee` — **`GENERATED ALWAYS AS (round(gmv * rate, 2)) STORED`**.
+  No code path (service, backfill, manual psql) can write a fee inconsistent
+  with the data. `services/ingestion/src/lib/commission.js` recomputes it in
+  integer cents for verification/reporting only.
+
+## 5. Latency budget (<5ms)
+
+The 5ms ceiling is why the edge worker:
+
+- does zero body reads before origin dispatch (the clone's tee branch is read
+  later, inside `waitUntil`);
+- streams both request and response bodies (never buffers);
+- memoizes route-map parsing per isolate;
+- performs the queue send strictly after the response is returned.
+
+Pre-dispatch synchronous work is bounded to URL parsing, three header reads, a
+map lookup, and `request.clone()` — all sub-millisecond operations.
+
+## 6. Compliance architecture
+
+From the AOP data-privacy memo ("pass-through analytics processor"):
+
+- **PII redaction at the edge** (`edge/src/redact.js`): key-based redaction of
+  name/email/phone/address/city/coordinate fields plus value-based scrubbing of
+  email/phone/street-address shapes in free text. Only zip, state/province and
+  country survive. PII exists in worker RAM for the pass-through milliseconds
+  only; it never reaches the queue, the ingestion service, or PostgreSQL. The
+  `pii_redactions` counter persists per record (in the JSONB `_edge` meta) as
+  the audit trail; a redactor failure drops the payload entirely (fail-safe).
+- **Data residency**: `user_geo` (from `X-User-Geo`, falling back to
+  Cloudflare's `request.cf.country`) and the derived `data_region`
+  (`eu` / `row`) ride every record so EU telemetry can be pinned to EU
+  infrastructure.
+- **90-day retention**: `purge_expired_telemetry(retention_days, batch_size)`
+  (migration `0006`) deletes expired `agent_intent_logs` in ctid-bounded batches
+  — dependent `loss_diagnostics` cascade; `reconciled_agent_orders` (billing)
+  are never purged. Schedule it via pg_cron or any external scheduler.

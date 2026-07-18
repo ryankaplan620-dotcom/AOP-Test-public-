@@ -1,0 +1,24 @@
+# --- secrets / local config ---
+.env
+.env.local
+*.pem
+
+# --- Node ---
+node_modules/
+npm-debug.log*
+coverage/
+dist/
+
+# --- Cloudflare Workers ---
+.wrangler/
+.dev.vars
+
+# --- Python ---
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# --- OS / editor noise ---
+.DS_Store
+*.log
