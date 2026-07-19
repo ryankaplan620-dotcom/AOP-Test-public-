@@ -66,6 +66,14 @@ retries, DLQ) with zero extra infrastructure.
   HMAC-SHA256 verification (mounted before any JSON parser — Shopify signs the
   exact bytes), token extraction from `note_attributes`, attribution stitch,
   idempotent reconciled-order INSERT.
+- `GET /auth/install` + `GET /auth/callback` — merchant onboarding: the
+  Shopify OAuth flow. Strict `*.myshopify.com` validation, Shopify's
+  callback HMAC + a signed expiring state nonce, code-for-token exchange,
+  **AES-256-GCM encryption of the access token at rest** (random IV per
+  encryption, shop domain bound as AAD — `lib/token-crypto.js` implements the
+  schema's ciphertext-only contract), idempotent merchant upsert, and
+  automatic `orders/create` webhook registration pointing back at this
+  service. Feature-gated (503) until the four onboarding vars are set.
 - `jobs/loss-sweep.js` — every 15s (default), finds intents older than the
   60-second conversion window with no reconciled order (by intent id or token)
   and no existing diagnostic, classifies each (`lib/loss-classifier.js`), and
