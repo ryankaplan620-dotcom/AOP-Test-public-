@@ -27,6 +27,8 @@
  * Typed error so src/index.js can distinguish "operator misconfigured the
  * deployment" (print message, exit 1, no stack spam) from an unexpected crash.
  */
+import { parseEncryptionKey } from './lib/token-crypto.js';
+
 export class ConfigError extends Error {
   constructor(message) {
     super(message);
@@ -120,13 +122,6 @@ export function loadConfig(env = process.env) {
     max: 3600000,
   });
 
-  if (problems.length > 0) {
-    throw new ConfigError(
-      'AOP ingestion service refused to start — configuration problems:\n' +
-        problems.map((p) => `  - ${p}`).join('\n')
-    );
-  }
-
   // --- dashboard analytics (optional feature) ----------------------------
   // DASHBOARD_API_TOKEN gates the read-only /analytics/* routes consumed by
   // the merchant Loss Diagnosis dashboard. OPTIONAL by design: deployments
@@ -147,6 +142,41 @@ export function loadConfig(env = process.env) {
       ? String(env.DASHBOARD_ALLOWED_ORIGIN).trim()
       : '*';
 
+  // --- merchant onboarding (optional feature, all-or-nothing group) ------
+  // The Shopify OAuth install flow needs all four; a partial configuration
+  // fails the boot loudly rather than shipping a half-working install page.
+  const oauthVars = ['SHOPIFY_API_KEY', 'SHOPIFY_API_SECRET', 'TOKEN_ENCRYPTION_KEY', 'APP_URL'];
+  const oauthPresent = oauthVars.filter((name) => {
+    const value = env[name];
+    return value !== undefined && value !== null && String(value).trim() !== '';
+  });
+  let shopifyOauth = null;
+  if (oauthPresent.length > 0 && oauthPresent.length < oauthVars.length) {
+    problems.push(
+      `Merchant onboarding is partially configured: have [${oauthPresent.join(', ')}], ` +
+        `missing [${oauthVars.filter((v) => !oauthPresent.includes(v)).join(', ')}]. ` +
+        'Set all four (or none, to disable the /auth routes).'
+    );
+  } else if (oauthPresent.length === oauthVars.length) {
+    try {
+      shopifyOauth = {
+        apiKey: String(env.SHOPIFY_API_KEY).trim(),
+        apiSecret: String(env.SHOPIFY_API_SECRET).trim(),
+        appUrl: String(env.APP_URL).trim().replace(/\/+$/, ''),
+        encryptionKey: parseEncryptionKey(env.TOKEN_ENCRYPTION_KEY),
+      };
+    } catch (err) {
+      problems.push(String(err?.message ?? err));
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new ConfigError(
+      'AOP ingestion service refused to start — configuration problems:\n' +
+        problems.map((p) => `  - ${p}`).join('\n')
+    );
+  }
+
   return {
     databaseUrl: String(env.DATABASE_URL).trim(),
     ingestApiToken: String(env.INGEST_API_TOKEN).trim(),
@@ -156,5 +186,8 @@ export function loadConfig(env = process.env) {
     lossSweepIntervalMs,
     dashboardApiToken,
     dashboardAllowedOrigin,
+    // null when the onboarding feature group is not configured; the /auth
+    // router answers 503 in that case.
+    shopifyOauth,
   };
 }

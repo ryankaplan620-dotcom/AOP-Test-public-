@@ -30,6 +30,36 @@ export const CATALOG = [
 export const PROTOCOLS = ['STRIPE_ACP', 'GOOGLE_AP2', 'VISA_INTELLIGENT_COMMERCE'];
 
 /**
+ * Prompt-context strings per outcome, exercising Context Reconstruction
+ * (services/ingestion/src/lib/intent-classifier.js). Losing sessions carry
+ * prompts thematically consistent with why they walk (a price-sensitive
+ * prompt for a price loss); WON sessions mix categories.
+ */
+export const PROMPTS = {
+  WON: [
+    'need an anniversary gift delivered by tomorrow',
+    'best quality sweater that is durable',
+    'reorder the same jeans again',
+  ],
+  PRICE_DISCREPANCY: [
+    'cheapest heavyweight tee under $30',
+    'best deal on selvedge jeans',
+  ],
+  SHIPPING_LATENCY: [
+    'birthday present, needs to arrive by friday',
+    'urgent gift for my wife asap',
+  ],
+  STOCK_OUTAGE: [
+    'wool cap in XL, top-rated',
+  ],
+  PROTOCOL_ERROR: [],
+  UNKNOWN_DROPOFF: [
+    'comparing options and reviews for chore jackets',
+    'blue jacket size medium', // context seen, unclassifiable -> UNCLASSIFIED
+  ],
+};
+
+/**
  * Outcome mix. Weights chosen so a few minutes of simulation populates every
  * dashboard element: ~30% conversions, and every loss reason represented.
  * The loss shapes mirror what src/lib/loss-classifier.js keys on:
@@ -103,12 +133,17 @@ export function buildScenario(sequence, rng) {
         ? 5 + Math.floor(rng() * 3) // 5-7 days: over the 3-day agent target
         : 1 + Math.floor(rng() * 2); // 1-2 days: agent-acceptable
 
+    const prompts = PROMPTS[outcome] ?? [];
     const payload = {
       items: [{ sku: product.sku, quantity: 1 }],
       quoted_price: product.price,
       delivery_days: quoteDays,
       destination: { zip: '94107', province: 'CA', country: 'US' },
     };
+    // Context Reconstruction fodder: most sessions carry a prompt excerpt.
+    if (prompts.length > 0 && rng() < 0.85) {
+      payload.prompt = prompts[Math.floor(rng() * prompts.length)];
+    }
 
     if (outcome === 'PRICE_DISCREPANCY') {
       // Competitor undercuts us. Field name matters: the loss classifier

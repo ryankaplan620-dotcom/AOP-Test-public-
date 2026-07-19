@@ -12,6 +12,7 @@
 
 import React, { useState } from 'react';
 import LossDiagnosis from './components/LossDiagnosis.jsx';
+import AgentTraffic from './components/AgentTraffic.jsx';
 import DataOptimizer from './components/DataOptimizer.jsx';
 import Simulator from './components/Simulator.jsx';
 import Settings from './components/Settings.jsx';
@@ -19,6 +20,7 @@ import { loadSettings } from './api.js';
 
 const TABS = [
   { id: 'loss', label: 'Loss Diagnosis' },
+  { id: 'traffic', label: 'Agent Traffic' },
   { id: 'optimizer', label: 'Data Optimizer' },
   { id: 'simulator', label: 'What-If Simulator' },
   { id: 'settings', label: 'Settings' },
@@ -51,6 +53,7 @@ export default function App() {
       </nav>
 
       {tab === 'loss' ? <LossDiagnosis settings={settings} /> : null}
+      {tab === 'traffic' ? <AgentTraffic settings={settings} /> : null}
       {tab === 'optimizer' ? <DataOptimizer settings={settings} /> : null}
       {tab === 'simulator' ? <Simulator settings={settings} /> : null}
       {tab === 'settings' ? <Settings settings={settings} onChange={setSettings} /> : null}

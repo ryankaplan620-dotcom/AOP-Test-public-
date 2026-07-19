@@ -7,7 +7,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test test/auth.test.mjs test/commission.test.mjs test/loss-classifier.test.mjs test/shopify-hmac.test.mjs test/validate-telemetry.test.mjs test/analytics-params.test.mjs"
+    "test": "node --test test/auth.test.mjs test/commission.test.mjs test/loss-classifier.test.mjs test/shopify-hmac.test.mjs test/validate-telemetry.test.mjs test/analytics-params.test.mjs test/token-crypto.test.mjs test/shopify-oauth.test.mjs test/intent-classifier.test.mjs"
   },
   "engines": {
     "node": ">=18.0.0"

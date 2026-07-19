@@ -10,6 +10,7 @@
  *   /analytics/summary?days=7       stat-card numbers + conversion rate
  *   /analytics/loss-reasons?days=7  ranked loss reasons with revenue + share
  *   /analytics/activity?limit=50    interleaved WON/LOST live stream
+ *   /analytics/traffic?days=7       protocol share, prompt categories, top SKUs
  *
  * Security model:
  *   - Read-only aggregates; no per-consumer PII exists downstream anyway
@@ -32,6 +33,7 @@ import {
   getLossReasonBreakdown,
   getLossPhaseBreakdown,
   getRecentActivity,
+  getTrafficBreakdown,
 } from '../repositories.js';
 
 /**
@@ -122,6 +124,27 @@ export function buildAnalyticsRouter({ config, db, logger }) {
           ...r,
           share_pct: percentShare(r.count, totalCount),
         })),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- GET /analytics/traffic ----------------------------------------------
+  router.get('/traffic', async (req, res, next) => {
+    try {
+      const windowDays = parseWindowDays(req.query.days);
+      const breakdown = await getTrafficBreakdown(db, { windowDays });
+      const protocolTotal = breakdown.protocols.reduce((sum, p) => sum + p.count, 0);
+      const intentTotal = breakdown.intent_categories.reduce((sum, c) => sum + c.count, 0);
+      res.json({
+        window_days: windowDays,
+        protocols: breakdown.protocols.map((p) => ({ ...p, share_pct: percentShare(p.count, protocolTotal) })),
+        intent_categories: breakdown.intent_categories.map((c) => ({
+          ...c,
+          share_pct: percentShare(c.count, intentTotal),
+        })),
+        top_skus: breakdown.top_skus,
       });
     } catch (err) {
       next(err);

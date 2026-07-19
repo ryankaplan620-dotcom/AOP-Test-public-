@@ -21,6 +21,7 @@ import express from 'express';
 import { buildTelemetryRouter } from './routes/telemetry.js';
 import { buildWebhooksRouter } from './routes/webhooks.js';
 import { buildAnalyticsRouter } from './routes/analytics.js';
+import { buildOAuthRouter } from './routes/oauth.js';
 
 /**
  * @param {{config: object, db: object, logger: object}} deps
@@ -50,6 +51,10 @@ export function buildApp({ config, db, logger }) {
   // ---- 3b. Dashboard analytics reads (bearer-gated; 503 until the
   // DASHBOARD_API_TOKEN feature gate is configured) -----------------------
   app.use('/analytics', buildAnalyticsRouter({ config, db, logger: logger.child('analytics') }));
+
+  // ---- 3c. Merchant onboarding: Shopify OAuth install flow (503 until the
+  // SHOPIFY_API_KEY/SECRET + TOKEN_ENCRYPTION_KEY + APP_URL group is set) --
+  app.use('/auth', buildOAuthRouter({ config, db, logger: logger.child('oauth') }));
 
   // ---- 4. Health probe ---------------------------------------------------
   // SELECT 1 proves the full path to PostgreSQL (pool checkout + round-trip),

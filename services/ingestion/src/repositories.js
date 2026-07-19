@@ -402,3 +402,76 @@ export async function getRecentActivity(db, { limit }) {
   );
   return result.rows;
 }
+
+/**
+ * Merchant onboarding upsert (routes/oauth.js): install or re-install.
+ *
+ * ON CONFLICT targets the functional unique index on lower(domain)
+ * (migration 0002) so 'Shop.myshopify.com' vs 'shop.myshopify.com' hit the
+ * same row. A re-install refreshes the encrypted token in place — the
+ * merchant id (and every FK pointing at it) is stable across reinstalls.
+ *
+ * @param {object} db
+ * @param {{shopDomain: string, encryptedToken: string}} merchant
+ *   shopDomain MUST be pre-validated (normalizeShopDomain); encryptedToken is
+ *   lib/token-crypto.js ciphertext — NEVER a plaintext token.
+ * @returns {Promise<{id: string, shopify_shop_domain: string}>}
+ */
+export async function upsertMerchantToken(db, { shopDomain, encryptedToken }) {
+  const result = await db.query(
+    `INSERT INTO merchant_profiles (shopify_shop_domain, access_token_encrypted)
+     VALUES ($1, $2)
+     ON CONFLICT ((lower(shopify_shop_domain)))
+     DO UPDATE SET access_token_encrypted = EXCLUDED.access_token_encrypted,
+                   updated_at = now()
+     RETURNING id, shopify_shop_domain`,
+    [shopDomain, encryptedToken]
+  );
+  return result.rows[0];
+}
+
+/**
+ * Agent Traffic breakdown (routes/analytics.js): protocol share, intent
+ * (prompt) categories, and the most-probed SKUs for one window. Three
+ * bounded aggregates in one round trip. intent_category lives in the stored
+ * JSONB under _edge (Context Reconstruction, lib/intent-classifier.js);
+ * rows without a context signal are excluded from that breakdown rather
+ * than pollute it with NULL.
+ */
+export async function getTrafficBreakdown(db, { windowDays }) {
+  const [protocols, intents, skus] = await Promise.all([
+    db.query(
+      `SELECT protocol_type AS protocol, count(*)::bigint AS count
+         FROM agent_intent_logs
+        WHERE processed_at >= now() - make_interval(days => $1)
+        GROUP BY protocol_type
+        ORDER BY count(*) DESC`,
+      [windowDays]
+    ),
+    db.query(
+      `SELECT inbound_payload->'_edge'->>'intent_category' AS category,
+              count(*)::bigint AS count
+         FROM agent_intent_logs
+        WHERE processed_at >= now() - make_interval(days => $1)
+          AND inbound_payload->'_edge'->>'intent_category' IS NOT NULL
+        GROUP BY 1
+        ORDER BY count(*) DESC`,
+      [windowDays]
+    ),
+    db.query(
+      `SELECT target_sku, count(*)::bigint AS probes
+         FROM agent_intent_logs
+        WHERE processed_at >= now() - make_interval(days => $1)
+          AND target_sku <> 'UNSPECIFIED'
+        GROUP BY target_sku
+        ORDER BY count(*) DESC
+        LIMIT 10`,
+      [windowDays]
+    ),
+  ]);
+  return {
+    protocols: protocols.rows.map((r) => ({ protocol: r.protocol, count: Number(r.count) })),
+    intent_categories: intents.rows.map((r) => ({ category: r.category, count: Number(r.count) })),
+    top_skus: skus.rows.map((r) => ({ sku: r.target_sku, probes: Number(r.probes) })),
+  };
+}
