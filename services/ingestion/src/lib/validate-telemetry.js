@@ -37,6 +37,8 @@
  * by test/validate-telemetry.test.mjs.
  */
 
+import { classifyIntentContext } from './intent-classifier.js';
+
 /** Mirrors the CHECK constraint on agent_intent_logs.request_method. */
 export const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
 
@@ -105,6 +107,16 @@ function buildEdgeMeta(record) {
 
   if (Number.isInteger(record.pii_redactions) && record.pii_redactions >= -1) {
     meta.pii_redactions = record.pii_redactions;
+  }
+
+  // Context Reconstruction (lib/intent-classifier.js): classify the agent's
+  // shopping context (prompt/intent fields in the payload) so the Agent
+  // Traffic screen can answer "which prompt categories drive traffic".
+  // null = no context signal at all -> field simply absent.
+  const intent = classifyIntentContext(record.inbound_payload);
+  if (intent !== null) {
+    meta.intent_category = intent.category;
+    meta.intent_source = intent.source;
   }
 
   return Object.keys(meta).length > 0 ? meta : null;
