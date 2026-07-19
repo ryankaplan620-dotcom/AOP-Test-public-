@@ -303,7 +303,7 @@ it('missing EDGE_LOG_QUEUE binding is tolerated (telemetry dropped, response int
 
 it('returns a 502 JSON error when no origin can be resolved, without calling fetch', async () => {
   const { sends, binding } = makeQueueSpy();
-  const env = makeEnv(binding, { MERCHANT_ROUTES: '{}', DEFAULT_ORIGIN: '' });
+  const env = makeEnv(binding, { MERCHANT_ROUTES: '{}', DEFAULT_ORIGIN: '', INGEST_API_URL: '' });
   const ctx = makeCtx();
   const calls = installMockOrigin(() => new Response('should never happen'));
 
@@ -355,6 +355,7 @@ it('refuses to proxy to itself when a route maps a hostname back to itself', asy
   const env = makeEnv(binding, {
     MERCHANT_ROUTES: JSON.stringify({ 'loop.aop.network': 'https://loop.aop.network' }),
     DEFAULT_ORIGIN: '',
+    INGEST_API_URL: '', // dynamic routing off: this test isolates the static self-loop guard
   });
   const ctx = makeCtx();
   const calls = installMockOrigin(() => new Response('nope'));
@@ -544,4 +545,136 @@ it('queue() logs and ACKS (drops) when INGEST_API_URL is unset instead of retryi
   assert.equal(calls.length, 0, 'no POST attempted without a destination');
   assert.equal(state.ackAllCalls, 1, 'batch dropped via ack so the queue does not wedge');
   assert.equal(state.retryAllCalls, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Dynamic (database-backed) routing: resolveOriginDynamic + fetch() fallback
+// ---------------------------------------------------------------------------
+
+import { clearDynamicRouteCache } from '../src/routing.js';
+
+/** Mock fetch that answers /routes/resolve and a mock origin, counting calls. */
+function installResolveAndOrigin({ resolveStatus = 200, origin = 'https://resolved-merchant.example.com' } = {}) {
+  const counts = { resolve: 0, origin: 0 };
+  const seen = { resolveAuth: null, originUrl: null };
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes('/routes/resolve')) {
+      counts.resolve += 1;
+      seen.resolveAuth = init.headers?.authorization ?? init.headers?.get?.('authorization') ?? null;
+      if (resolveStatus !== 200) return new Response('{"error":"no route"}', { status: resolveStatus });
+      return new Response(JSON.stringify({ hostname: 'x', origin }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    counts.origin += 1;
+    seen.originUrl = url;
+    return new Response('origin-ok', { status: 200 });
+  };
+  return { counts, seen };
+}
+
+it('falls back to dynamic resolution when static routes miss, and caches it', async () => {
+  clearDynamicRouteCache();
+  const { sends, binding } = makeQueueSpy();
+  const env = makeEnv(binding, { MERCHANT_ROUTES: '{}', DEFAULT_ORIGIN: '' });
+  const { counts, seen } = installResolveAndOrigin();
+
+  const request = () =>
+    worker.fetch(
+      new Request('https://newstore.agents.aop.network/availability?sku=DYN-1', {
+        headers: { 'X-Agent-Transaction-Token': 'tok_dyn' },
+      }),
+      env,
+      makeCtx(),
+    );
+
+  const first = await request();
+  assert.equal(first.status, 200);
+  assert.equal(await first.text(), 'origin-ok');
+  assert.equal(counts.resolve, 1, 'one control-plane lookup on the cold path');
+  assert.equal(seen.resolveAuth, 'Bearer test-token', 'resolve call carries the edge credential');
+  assert.ok(seen.originUrl.startsWith('https://resolved-merchant.example.com/availability'));
+
+  const second = await request();
+  assert.equal(second.status, 200);
+  assert.equal(counts.resolve, 1, 'second request must hit the per-isolate cache');
+  assert.equal(counts.origin, 2);
+});
+
+it('caches negative resolutions and returns the controlled 502', async () => {
+  clearDynamicRouteCache();
+  const { binding } = makeQueueSpy();
+  const env = makeEnv(binding, { MERCHANT_ROUTES: '{}', DEFAULT_ORIGIN: '' });
+  const { counts } = installResolveAndOrigin({ resolveStatus: 404 });
+
+  for (let i = 0; i < 3; i++) {
+    const response = await worker.fetch(
+      new Request('https://unknown.agents.aop.network/availability?sku=X'),
+      env,
+      makeCtx(),
+    );
+    assert.equal(response.status, 502);
+    assert.equal((await response.json()).error, 'no_origin_configured');
+  }
+  assert.equal(counts.resolve, 1, 'negative result cached — one lookup for three requests');
+  assert.equal(counts.origin, 0, 'nothing proxied for an unroutable host');
+});
+
+it('suffix gate: non-matching hostnames never trigger a dynamic lookup', async () => {
+  clearDynamicRouteCache();
+  const { binding } = makeQueueSpy();
+  const env = makeEnv(binding, {
+    MERCHANT_ROUTES: '{}',
+    DEFAULT_ORIGIN: '',
+    PROXY_HOSTNAME_SUFFIX: '.agents.aop.network',
+  });
+  const { counts } = installResolveAndOrigin();
+
+  const outside = await worker.fetch(
+    new Request('https://scanner-spray.example.org/availability'),
+    env,
+    makeCtx(),
+  );
+  assert.equal(outside.status, 502);
+  assert.equal(counts.resolve, 0, 'suffix mismatch must not reach the control plane');
+
+  const inside = await worker.fetch(
+    new Request('https://shop.agents.aop.network/availability?sku=A'),
+    env,
+    makeCtx(),
+  );
+  assert.equal(inside.status, 200);
+  assert.equal(counts.resolve, 1);
+});
+
+it('dynamic resolution failure degrades to 502, never an exception', async () => {
+  clearDynamicRouteCache();
+  const { binding } = makeQueueSpy();
+  const env = makeEnv(binding, { MERCHANT_ROUTES: '{}', DEFAULT_ORIGIN: '' });
+  globalThis.fetch = async () => {
+    throw new Error('control plane unreachable');
+  };
+  const response = await worker.fetch(
+    new Request('https://anything.agents.aop.network/availability'),
+    env,
+    makeCtx(),
+  );
+  assert.equal(response.status, 502);
+});
+
+it('static MERCHANT_ROUTES still wins without any dynamic lookup', async () => {
+  clearDynamicRouteCache();
+  const { binding } = makeQueueSpy();
+  const env = makeEnv(binding); // has the redthread static route
+  const { counts } = installResolveAndOrigin();
+
+  const response = await worker.fetch(
+    new Request('https://agents.redthread.aop.network/products/1'),
+    env,
+    makeCtx(),
+  );
+  assert.equal(response.status, 200);
+  assert.equal(counts.resolve, 0, 'static hit must stay on the synchronous path');
 });

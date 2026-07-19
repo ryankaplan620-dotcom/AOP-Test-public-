@@ -103,3 +103,12 @@ test('buildAuthorizeUrl targets the validated shop with the exact contract param
   assert.equal(url.searchParams.get('redirect_uri'), 'https://ingest.aop.network/auth/callback');
   assert.equal(url.searchParams.get('state'), 'nonce123');
 });
+
+test('deriveProxyHostname builds <handle><suffix> or null', async () => {
+  const { deriveProxyHostname } = await import('../src/lib/shopify-oauth.js');
+  assert.equal(deriveProxyHostname('redthread.myshopify.com', '.agents.aop.network'), 'redthread.agents.aop.network');
+  assert.equal(deriveProxyHostname('RedThread.MyShopify.com', '.agents.aop.network'), 'redthread.agents.aop.network');
+  assert.equal(deriveProxyHostname('redthread.myshopify.com', null), null, 'no suffix -> null');
+  assert.equal(deriveProxyHostname('redthread.myshopify.com', 'nodot'), null, 'suffix must start with dot');
+  assert.equal(deriveProxyHostname('evil.com', '.agents.aop.network'), null, 'invalid shop -> null');
+});

@@ -417,15 +417,20 @@ export async function getRecentActivity(db, { limit }) {
  *   lib/token-crypto.js ciphertext — NEVER a plaintext token.
  * @returns {Promise<{id: string, shopify_shop_domain: string}>}
  */
-export async function upsertMerchantToken(db, { shopDomain, encryptedToken }) {
+export async function upsertMerchantToken(db, { shopDomain, encryptedToken, proxyHostname = null, originUrl = null }) {
+  // Routing columns use COALESCE(existing, new): install supplies sensible
+  // defaults (derived proxy hostname, https://<shop domain> origin) but a
+  // reinstall must never clobber routing an operator customized by hand.
   const result = await db.query(
-    `INSERT INTO merchant_profiles (shopify_shop_domain, access_token_encrypted)
-     VALUES ($1, $2)
+    `INSERT INTO merchant_profiles (shopify_shop_domain, access_token_encrypted, proxy_hostname, origin_url)
+     VALUES ($1, $2, $3, $4)
      ON CONFLICT ((lower(shopify_shop_domain)))
      DO UPDATE SET access_token_encrypted = EXCLUDED.access_token_encrypted,
+                   proxy_hostname = COALESCE(merchant_profiles.proxy_hostname, EXCLUDED.proxy_hostname),
+                   origin_url = COALESCE(merchant_profiles.origin_url, EXCLUDED.origin_url),
                    updated_at = now()
-     RETURNING id, shopify_shop_domain`,
-    [shopDomain, encryptedToken]
+     RETURNING id, shopify_shop_domain, proxy_hostname, origin_url`,
+    [shopDomain, encryptedToken, proxyHostname, originUrl]
   );
   return result.rows[0];
 }
@@ -577,4 +582,27 @@ export async function getPriceBenchmark(db, { windowDays }) {
       revenue_lost: String(r.revenue_lost),
     })),
   };
+}
+
+/**
+ * Dynamic edge routing lookup (routes/routing.js -> edge worker).
+ *
+ * Answers "which storefront origin serves this proxy hostname?" from the
+ * columns OAuth install populates (migration 0007). Case-insensitive via the
+ * partial functional unique index; rows without an origin_url are not
+ * routable and return null exactly like unknown hostnames.
+ *
+ * @returns {Promise<{origin: string}|null>}
+ */
+export async function findRouteByProxyHostname(db, hostname) {
+  const result = await db.query(
+    `SELECT origin_url
+       FROM merchant_profiles
+      WHERE proxy_hostname IS NOT NULL
+        AND lower(proxy_hostname) = lower($1)
+        AND origin_url IS NOT NULL
+      LIMIT 1`,
+    [hostname]
+  );
+  return result.rows[0] ? { origin: result.rows[0].origin_url } : null;
 }

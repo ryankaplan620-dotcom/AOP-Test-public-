@@ -48,6 +48,20 @@ built by assigning `pathname`/`search` onto the configured origin — never by
 resolving the inbound path against it — so a hostile `//host` path can't turn the
 worker into an open proxy.
 
+### Dynamic merchant routing (onboarding -> edge, no redeploy)
+
+The worker resolves a proxy hostname to a merchant origin from
+`env.MERCHANT_ROUTES` (static config) first; on a miss it falls back to
+`GET /routes/resolve` on the ingestion service, which reads
+`merchant_profiles.proxy_hostname -> origin_url` — the columns the OAuth
+callback populates at install (migration 0007). So installing a merchant
+makes them routable immediately, with no `wrangler deploy`. The lookup runs
+only on a per-isolate cache miss (60s positive / 30s negative TTL, in-flight
+deduped), keeping steady-state traffic on the synchronous <5ms path; the
+`PROXY_HOSTNAME_SUFFIX` gate bounds lookups to the platform's own namespace
+so scanner spray never reaches the control plane; and the resolve call
+carries the same `INGEST_API_TOKEN` the edge already holds.
+
 ### The Queue Broker (Cloudflare Queues)
 
 High-throughput buffer between the edge and the database, protecting PostgreSQL

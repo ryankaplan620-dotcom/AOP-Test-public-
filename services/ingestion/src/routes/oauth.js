@@ -32,6 +32,7 @@ import {
   createStateNonce,
   verifyStateNonce,
   buildAuthorizeUrl,
+  deriveProxyHostname,
 } from '../lib/shopify-oauth.js';
 import { encryptToken } from '../lib/token-crypto.js';
 import { upsertMerchantToken } from '../repositories.js';
@@ -175,8 +176,17 @@ export function buildOAuthRouter({ config, db, logger, adminBaseOverride }) {
       }
 
       // Encrypt-then-store: the plaintext token exists only in this scope.
+      // Routing defaults land in the same upsert: origin = the shop's own
+      // domain, proxy hostname derived from PROXY_HOSTNAME_SUFFIX (nullable).
+      // The edge resolves these via GET /routes/resolve — installing IS
+      // becoming routable; no worker redeploy.
       const ciphertext = encryptToken(accessToken, encryptionKey, shop);
-      const merchant = await upsertMerchantToken(db, { shopDomain: shop, encryptedToken: ciphertext });
+      const merchant = await upsertMerchantToken(db, {
+        shopDomain: shop,
+        encryptedToken: ciphertext,
+        proxyHostname: deriveProxyHostname(shop, config.proxyHostnameSuffix),
+        originUrl: `https://${shop}`,
+      });
 
       const webhookStatus = await registerOrdersWebhook({
         shop,
@@ -196,8 +206,10 @@ export function buildOAuthRouter({ config, db, logger, adminBaseOverride }) {
         shop,
         merchant_id: merchant.id,
         webhook: webhookStatus,
-        next_step:
-          'Point your ACP/AP2 endpoint configuration at your AOP proxy URL — agent telemetry starts flowing immediately.',
+        proxy_hostname: merchant.proxy_hostname ?? null,
+        next_step: merchant.proxy_hostname
+          ? `Point your ACP/AP2 endpoint configuration at https://${merchant.proxy_hostname} — agent telemetry starts flowing immediately.`
+          : 'Ask your AOP operator to assign your proxy hostname (merchant_profiles.proxy_hostname), then point your ACP/AP2 endpoints at it.',
       });
     } catch (err) {
       next(err); // central handler: opaque 500, full log

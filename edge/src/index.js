@@ -29,7 +29,7 @@
  */
 
 import { extractAgentSignature, buildTelemetryRecord } from './telemetry.js';
-import { resolveOrigin } from './routing.js';
+import { resolveOrigin, resolveOriginDynamic } from './routing.js';
 
 /**
  * Intent endpoints we intercept for telemetry. Matched as the FINAL path
@@ -231,11 +231,20 @@ export default {
       const url = new URL(request.url);
       const signature = extractAgentSignature(request); // two header reads
       const intercepted = isInterceptedPath(url.pathname);
-      const originBase = resolveOrigin(url.hostname, env); // memoized lookup
+      let originBase = resolveOrigin(url.hostname, env); // memoized lookup
 
       // Clone BEFORE the origin consumes the body stream. Only intent
       // endpoints pay the clone cost; all other traffic skips it entirely.
       const telemetryClone = intercepted ? safeClone(request) : null;
+
+      if (!originBase) {
+        // Static table + DEFAULT_ORIGIN missed: fall back to the dynamic
+        // (merchant_profiles-backed) resolver so OAuth-onboarded merchants
+        // are routable with NO worker redeploy. This await runs only on a
+        // per-isolate cache miss (see routing.js) — steady state stays on
+        // the synchronous <5ms path above.
+        originBase = await resolveOriginDynamic(url.hostname, env);
+      }
 
       if (!originBase) {
         // Unknown hostname and no DEFAULT_ORIGIN (or the route would loop back

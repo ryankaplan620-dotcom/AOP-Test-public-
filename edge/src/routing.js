@@ -148,3 +148,116 @@ export function resolveOrigin(hostname, env) {
     return null;
   }
 }
+
+/* --------------------------------------------------------------------------
+ * Dynamic (database-backed) resolution.
+ *
+ * Static MERCHANT_ROUTES requires a config edit + worker redeploy for every
+ * merchant — which broke the promise of one-click OAuth onboarding. When the
+ * static table (and DEFAULT_ORIGIN) miss, the worker asks the ingestion
+ * service, whose /routes/resolve endpoint reads merchant_profiles
+ * (proxy_hostname -> origin_url, populated at install).
+ *
+ * Latency contract: the lookup is an HTTPS round trip, so it runs ONLY on a
+ * per-isolate cache miss — the first request for a hostname on a fresh
+ * isolate pays it once; every subsequent request is a synchronous Map hit
+ * (positive TTL 60s, negative TTL 30s), keeping steady state inside the
+ * <5ms budget. In-flight lookups are deduplicated so a burst of first
+ * requests costs one round trip, not N.
+ *
+ * Abuse bound: internet scanners spray arbitrary Host headers. When
+ * env.PROXY_HOSTNAME_SUFFIX is set, only hostnames ending in that suffix are
+ * ever looked up — everything else stays a local (cached-nothing) 502.
+ * -------------------------------------------------------------------------- */
+
+/** Cache TTLs (ms). Positive entries refresh routing changes within a
+ * minute; negative entries stop repeat lookups for unknown hosts without
+ * masking a just-onboarded merchant for long. */
+const DYNAMIC_POSITIVE_TTL_MS = 60_000;
+const DYNAMIC_NEGATIVE_TTL_MS = 30_000;
+
+/** Resolve-call timeout: a slow control-plane lookup must fail fast into the
+ * controlled-502 path, never hang an agent request. */
+const RESOLVE_TIMEOUT_MS = 1_500;
+
+/** hostname -> {origin: string|null, expiresAt: number} */
+let dynamicCache = new Map();
+/** hostname -> Promise<string|null> for in-flight dedup. */
+let dynamicInFlight = new Map();
+
+/** Test hook: reset dynamic-resolution state between unit tests. */
+export function clearDynamicRouteCache() {
+  dynamicCache = new Map();
+  dynamicInFlight = new Map();
+}
+
+/**
+ * Resolve a hostname via the ingestion service's /routes/resolve endpoint.
+ *
+ * Never throws; resolves to a normalized origin or null. null results are
+ * ALSO cached (negative TTL) — the fetch handler turns them into the same
+ * controlled 502 as before.
+ *
+ * @param {string} hostname incoming request hostname.
+ * @param {object} env worker vars (INGEST_API_URL, INGEST_API_TOKEN,
+ *   PROXY_HOSTNAME_SUFFIX optional).
+ * @returns {Promise<string|null>}
+ */
+export async function resolveOriginDynamic(hostname, env) {
+  try {
+    const host = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+    if (host === '') return null;
+
+    // Suffix gate: bound lookups to our own proxy namespace when configured.
+    const suffix =
+      typeof env?.PROXY_HOSTNAME_SUFFIX === 'string' ? env.PROXY_HOSTNAME_SUFFIX.trim().toLowerCase() : '';
+    if (suffix !== '' && !host.endsWith(suffix)) return null;
+
+    const base = typeof env?.INGEST_API_URL === 'string' ? env.INGEST_API_URL.trim().replace(/\/+$/, '') : '';
+    if (base === '') return null; // dynamic routing unconfigured — static only
+
+    const cached = dynamicCache.get(host);
+    if (cached && cached.expiresAt > Date.now()) return cached.origin;
+
+    const inFlight = dynamicInFlight.get(host);
+    if (inFlight) return inFlight;
+
+    const lookup = (async () => {
+      let origin = null;
+      try {
+        const headers = { accept: 'application/json' };
+        const token = env?.INGEST_API_TOKEN;
+        if (typeof token === 'string' && token !== '') headers.authorization = `Bearer ${token}`;
+
+        const response = await fetch(`${base}/routes/resolve?hostname=${encodeURIComponent(host)}`, {
+          headers,
+          signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(RESOLVE_TIMEOUT_MS) : undefined,
+        });
+        if (response.ok) {
+          const payload = await response.json().catch(() => null);
+          origin = normalizeOrigin(payload?.origin);
+          // Same self-loop guard as the static path.
+          if (origin !== null && new URL(origin).hostname.toLowerCase() === host) origin = null;
+        }
+        // Non-2xx (404 unknown host, 401 misconfig, 5xx outage) -> null; the
+        // negative TTL below keeps outages from hammering the control plane.
+      } catch {
+        origin = null; // network/timeout — controlled 502 downstream
+      }
+      dynamicCache.set(host, {
+        origin,
+        expiresAt: Date.now() + (origin !== null ? DYNAMIC_POSITIVE_TTL_MS : DYNAMIC_NEGATIVE_TTL_MS),
+      });
+      return origin;
+    })();
+
+    dynamicInFlight.set(host, lookup);
+    try {
+      return await lookup;
+    } finally {
+      dynamicInFlight.delete(host);
+    }
+  } catch {
+    return null; // absolute backstop, same contract as resolveOrigin()
+  }
+}
