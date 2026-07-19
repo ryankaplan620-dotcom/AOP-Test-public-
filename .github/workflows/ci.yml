@@ -203,4 +203,58 @@ jobs:
           EXCEPTION WHEN check_violation THEN
             RAISE NOTICE 'commission_rate bound enforced (ok)';
           END $$;
+          -- Credit ledger (migration 0008): generated commission_credit must
+          -- mirror the fee math at the parent order's snapshotted rate.
+          INSERT INTO order_adjustments
+            (merchant_id, reconciled_order_id, source_event_id, adjustment_kind,
+             adjusted_gmv, commission_rate)
+            SELECT r.merchant_id, r.id, 'refund:ci-1', 'REFUND', 200.00, r.commission_rate
+              FROM reconciled_agent_orders r WHERE r.shopify_order_id = 'ci-order-1';
+          DO $$
+          DECLARE credit numeric;
+          BEGIN
+            SELECT commission_credit INTO credit FROM order_adjustments
+             WHERE source_event_id = 'refund:ci-1';
+            -- 200.00 * 0.005 = 1.00
+            IF credit <> 1.00 THEN
+              RAISE EXCEPTION 'commission_credit % != expected 1.00', credit;
+            END IF;
+            RAISE NOTICE 'generated commission_credit = % (ok)', credit;
+          END $$;
+          -- Redelivery idempotency: same source_event_id must be rejected.
+          DO $$
+          BEGIN
+            INSERT INTO order_adjustments
+              (merchant_id, reconciled_order_id, source_event_id, adjustment_kind,
+               adjusted_gmv, commission_rate)
+              SELECT r.merchant_id, r.id, 'refund:ci-1', 'REFUND', 1.00, r.commission_rate
+                FROM reconciled_agent_orders r WHERE r.shopify_order_id = 'ci-order-1';
+            RAISE EXCEPTION 'source_event_id uniqueness NOT enforced';
+          EXCEPTION WHEN unique_violation THEN
+            RAISE NOTICE 'source_event_id uniqueness enforced (ok)';
+          END $$;
+          -- Telemetry idempotency (migration 0009): duplicate event_id no-ops.
+          INSERT INTO agent_intent_logs
+            (merchant_id, transaction_token, protocol_type, request_method,
+             endpoint_path, target_sku, event_id)
+            SELECT id, 'tok_ci', 'ACP', 'GET', '/availability', 'SKU-1',
+                   'ffffffff-1111-2222-3333-444444444444'
+              FROM merchant_profiles WHERE shopify_shop_domain = 'ci.example.com';
+          INSERT INTO agent_intent_logs
+            (merchant_id, transaction_token, protocol_type, request_method,
+             endpoint_path, target_sku, event_id)
+            SELECT id, 'tok_ci', 'ACP', 'GET', '/availability', 'SKU-1',
+                   'ffffffff-1111-2222-3333-444444444444'
+              FROM merchant_profiles WHERE shopify_shop_domain = 'ci.example.com'
+          ON CONFLICT (event_id) WHERE event_id IS NOT NULL DO NOTHING;
+          DO $$
+          DECLARE n bigint;
+          BEGIN
+            SELECT count(*) INTO n FROM agent_intent_logs
+             WHERE event_id = 'ffffffff-1111-2222-3333-444444444444';
+            IF n <> 1 THEN
+              RAISE EXCEPTION 'event_id dedup failed: % rows', n;
+            END IF;
+            RAISE NOTICE 'event_id dedup enforced (ok)';
+          END $$;
           SQL

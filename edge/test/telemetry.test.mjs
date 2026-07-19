@@ -372,3 +372,24 @@ it('buildTelemetryRecord flags EU traffic for EU data residency', async () => {
   assert.equal(unknown.user_geo, null);
   assert.equal(unknown.data_region, null);
 });
+
+// ---------------------------------------------------------------------------
+// event_id — the ingest idempotency key (db migration 0009)
+// ---------------------------------------------------------------------------
+
+it('stamps a UUID event_id on every record, unique per build call', async () => {
+  const url = 'https://proxy.example/availability?sku=SKU-1';
+  const a = await buildTelemetryRecord(null, url, META);
+  const b = await buildTelemetryRecord(null, url, META);
+  const uuidShape = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  assert.match(a.event_id, uuidShape);
+  assert.match(b.event_id, uuidShape);
+  // Minted once per record at request time — two records never share an id
+  // (the SAME id only ever reappears via queue redelivery of one record).
+  assert.notEqual(a.event_id, b.event_id);
+});
+
+it('event_id survives the degraded/hostile record paths', async () => {
+  const record = await buildTelemetryRecord(null, 'not a url at all', undefined);
+  assert.match(record.event_id, /^[0-9a-f-]{36}$/i);
+});

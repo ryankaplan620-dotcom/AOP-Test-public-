@@ -87,6 +87,66 @@ export function createDbPool(config, logger) {
   }
 
   /**
+   * Run fn against ONE checked-out client. pool.query() may use a different
+   * connection per statement, which breaks anything connection-scoped:
+   * transactions (BEGIN/COMMIT must share a session) and advisory locks
+   * (pg_advisory_unlock on another connection is a no-op that leaks the
+   * lock). fn receives a query(text, params) bound to the pinned client;
+   * the client is always released, even when fn throws.
+   *
+   * @param {(query: (text: string, params?: Array) => Promise<pg.QueryResult>) => Promise<any>} fn
+   */
+  async function withClient(fn) {
+    const client = await pool.connect();
+    try {
+      return await fn((text, params = []) => client.query(text, params));
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Run fn only if this process wins the named advisory lock — the guard
+   * that lets multiple ingestion replicas run the same periodic sweep
+   * without double work. Session-level (not xact) lock held on a PINNED
+   * client for fn's whole duration, so fn is free to run its own queries
+   * through the normal pool without holding a transaction open.
+   *
+   * Non-blocking by design (pg_try_advisory_lock): a replica that loses the
+   * race skips the tick instead of queueing behind the winner — the next
+   * interval tick will try again.
+   *
+   * @param {number} lockKey  stable bigint-safe integer identifying the job.
+   * @param {() => Promise<any>} fn
+   * @returns {Promise<{ran: boolean, result: any}>} ran=false means another
+   *   holder had the lock and fn was skipped.
+   */
+  async function withAdvisoryLock(lockKey, fn) {
+    return withClient(async (clientQuery) => {
+      const grab = await clientQuery('SELECT pg_try_advisory_lock($1) AS locked', [lockKey]);
+      if (grab.rows[0]?.locked !== true) {
+        return { ran: false, result: null };
+      }
+      try {
+        return { ran: true, result: await fn() };
+      } finally {
+        // Same pinned connection — this is what makes the unlock real.
+        // Failure here is survivable: releasing the client back with the
+        // session lock still held keeps it held until the connection is
+        // recycled (idleTimeout), which stalls—not breaks—the next sweep.
+        try {
+          await clientQuery('SELECT pg_advisory_unlock($1)', [lockKey]);
+        } catch (err) {
+          logger.warn('advisory unlock failed; lock releases when the connection recycles', {
+            err,
+            lock_key: lockKey,
+          });
+        }
+      }
+    });
+  }
+
+  /**
    * Graceful shutdown: waits for checked-out clients to be released, then
    * closes every connection. Idempotent-ish guard because both the SIGTERM
    * and SIGINT paths (plus test teardown) may race to call it.
@@ -105,5 +165,5 @@ export function createDbPool(config, logger) {
     }
   }
 
-  return { query, end, pool };
+  return { query, withClient, withAdvisoryLock, end, pool };
 }

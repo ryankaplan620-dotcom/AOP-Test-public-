@@ -134,6 +134,16 @@ export function loadConfig(env = process.env) {
     max: 86400000,
   });
 
+  // Abuse bound: max requests per client IP per minute, per replica (see
+  // src/lib/rate-limit.js). Default 600 (10 rps sustained) clears every
+  // legitimate producer — the edge queue consumer POSTs batches, Shopify
+  // webhooks are per-order — while capping signature-check CPU burn from
+  // floods. RATE_LIMIT_PER_MINUTE=0 disables (min 0 admits it).
+  const rateLimitPerMinute = parsePositiveInt(env, 'RATE_LIMIT_PER_MINUTE', 600, problems, {
+    min: 0,
+    max: 1000000,
+  });
+
   // --- dashboard analytics (optional feature) ----------------------------
   // DASHBOARD_API_TOKEN gates the read-only /analytics/* routes consumed by
   // the merchant Loss Diagnosis dashboard. OPTIONAL by design: deployments
@@ -221,6 +231,7 @@ export function loadConfig(env = process.env) {
     lossSweepIntervalMs,
     retentionDays,
     retentionSweepIntervalMs,
+    rateLimitPerMinute,
     dashboardApiToken,
     dashboardAllowedOrigin,
     // null when the onboarding feature group is not configured; the /auth

@@ -31,12 +31,23 @@
 /** Rows deleted per inner purge transaction (see purge_expired_telemetry). */
 const PURGE_BATCH_SIZE = 10_000;
 
+/** Advisory-lock key (unique among AOP jobs; see loss-sweep's 815001). */
+export const RETENTION_SWEEP_LOCK_KEY = 815002;
+
 export function startRetentionSweep({ db, config, logger }) {
   let running = false; // overlap guard
   let stopped = false;
   let inFlight = Promise.resolve();
 
-  async function runOnce() {
+  // Cross-replica guard (same rationale as loss-sweep): the purge is
+  // idempotent, so the lock removes duplicate ctid-batch scans across
+  // scaled-out replicas rather than preventing corruption.
+  const withLock =
+    typeof db.withAdvisoryLock === 'function'
+      ? (fn) => db.withAdvisoryLock(RETENTION_SWEEP_LOCK_KEY, fn)
+      : async (fn) => ({ ran: true, result: await fn() });
+
+  async function purgePass() {
     const summary = { intents_deleted: 0, failed: false };
     try {
       const result = await db.query('SELECT * FROM purge_expired_telemetry($1, $2)', [
@@ -57,6 +68,17 @@ export function startRetentionSweep({ db, config, logger }) {
       logger.error('retention purge failed; will retry next tick', { err });
     }
     return summary;
+  }
+
+  async function runOnce() {
+    try {
+      const { ran, result } = await withLock(purgePass);
+      if (!ran) return { intents_deleted: 0, failed: false, skipped: true };
+      return result;
+    } catch (err) {
+      logger.error('retention purge could not acquire/release the advisory lock; will retry next tick', { err });
+      return { intents_deleted: 0, failed: true, skipped: true };
+    }
   }
 
   const timer = setInterval(() => {

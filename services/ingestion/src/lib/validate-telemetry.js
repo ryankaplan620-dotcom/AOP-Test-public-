@@ -61,6 +61,9 @@ const ANONYMOUS_TOKEN = 'headless_anonymous';
 const UNKNOWN_PROTOCOL = 'UNKNOWN_PROTOCOL';
 const UNSPECIFIED_SKU = 'UNSPECIFIED';
 
+/** UUID shape for the edge-minted idempotency id (db migration 0009). */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /** True for a plain object ({} — not array, not null). */
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -135,6 +138,7 @@ function buildEdgeMeta(record) {
  * @returns {{ok: true, value: {
  *     token: string, protocol: string, method: string, path: string,
  *     targetSku: string, shopDomain: string, payload: object|null,
+ *     eventId: string|null,
  *   }} | {ok: false, error: string}}  Never throws.
  */
 export function validateTelemetryRecord(record) {
@@ -142,6 +146,13 @@ export function validateTelemetryRecord(record) {
     if (!isPlainObject(record)) {
       return { ok: false, error: 'record must be a JSON object' };
     }
+
+    // --- event id (ingest idempotency key, db migration 0009) -----------
+    // Optional: pre-0009 edge builds don't send one, and a malformed value
+    // degrades to null (record still ingests — it just loses redelivery
+    // dedup) rather than rejecting telemetry the edge already shipped.
+    const eventIdRaw = asTrimmedString(record.event_id);
+    const eventId = eventIdRaw !== null && UUID_PATTERN.test(eventIdRaw) ? eventIdRaw.toLowerCase() : null;
 
     // --- transaction token (attribution key) ----------------------------
     // Missing/blank degrades to the anonymous sentinel (matches the edge's
@@ -226,7 +237,7 @@ export function validateTelemetryRecord(record) {
 
     return {
       ok: true,
-      value: { token, protocol, method, path, targetSku, shopDomain, payload },
+      value: { token, protocol, method, path, targetSku, shopDomain, payload, eventId },
     };
   } catch {
     // Hostile getters etc. — contract: never throws.

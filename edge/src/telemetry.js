@@ -237,6 +237,18 @@ export async function buildTelemetryRecord(clonedRequest, url, meta = {}) {
   // Start from a fully-populated skeleton so every downstream consumer can rely
   // on the shape even when parsing fails half-way through.
   const record = {
+    // Idempotency id, minted ONCE here — i.e. before queue.send — so a
+    // Cloudflare Queues redelivery carries the SAME id and the ingestion
+    // service's partial unique index (db migration 0009) turns re-insertion
+    // into a no-op instead of double-counting the intent. null if the
+    // runtime lacks randomUUID (ingest treats null as "no dedup possible").
+    event_id: (() => {
+      try {
+        return typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : null;
+      } catch {
+        return null;
+      }
+    })(),
     token:
       typeof safeMeta.token === 'string' && safeMeta.token !== ''
         ? safeMeta.token

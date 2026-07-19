@@ -26,6 +26,7 @@ const INTENT_LOG_COLUMNS = [
   'endpoint_path',
   'target_sku',
   'inbound_payload',
+  'event_id',
 ];
 
 /**
@@ -71,7 +72,10 @@ export async function insertIntentLogsBatch(db, rows) {
     // would serialize a JS array parameter as a Postgres array literal, not
     // JSON — the explicit ::jsonb cast on a JSON string is unambiguous.
     const payloadJson = row.payload === null || row.payload === undefined ? null : JSON.stringify(row.payload);
-    params.push(row.merchantId, row.token, row.protocol, row.method, row.path, row.targetSku, payloadJson, index);
+    params.push(
+      row.merchantId, row.token, row.protocol, row.method, row.path, row.targetSku, payloadJson,
+      row.eventId ?? null, index
+    );
     const base = params.length - (INTENT_LOG_COLUMNS.length + 1);
     // Placeholders only. processed_at = now() + batch-position microseconds:
     // every row of a multi-row INSERT shares the transaction's now(), which
@@ -82,13 +86,20 @@ export async function insertIntentLogsBatch(db, rows) {
     // position is far below any real inter-probe gap and preserves order.
     return (
       `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::jsonb, ` +
-      `now() + make_interval(secs => $${base + 8}::float8 / 1e6))`
+      `$${base + 8}::uuid, now() + make_interval(secs => $${base + 9}::float8 / 1e6))`
     );
   });
 
+  // ON CONFLICT against the partial unique event_id index (migration 0009):
+  // Cloudflare Queues redelivers batches at least once, and the edge stamps
+  // event_id BEFORE queue.send — so a redelivered record carries the same id
+  // and lands here as a silent no-op instead of double-counting the intent.
+  // Rows with NULL event_id (pre-0009 edge builds) never match the partial
+  // index and insert exactly as before.
   const result = await db.query(
     `INSERT INTO agent_intent_logs (${INTENT_LOG_COLUMNS.join(', ')}, processed_at)
-     VALUES ${valueGroups.join(', ')}`,
+     VALUES ${valueGroups.join(', ')}
+     ON CONFLICT (event_id) WHERE event_id IS NOT NULL DO NOTHING`,
     params
   );
   return result.rowCount ?? 0;
@@ -161,14 +172,14 @@ export async function findLatestIntentByToken(db, merchantId, transactionToken) 
  * @returns {Promise<{inserted: boolean, row: object|null}>}
  *   inserted=false means the conflict path fired (webhook redelivery).
  */
-export async function insertReconciledOrder(db, { merchantId, intentLogId, shopifyOrderId, transactionToken, gmv }) {
+export async function insertReconciledOrder(db, { merchantId, intentLogId, shopifyOrderId, transactionToken, gmv, currency = null }) {
   const insert = async (intentId) => db.query(
     `INSERT INTO reconciled_agent_orders
-        (merchant_id, intent_log_id, shopify_order_id, transaction_token, gross_merchandise_value)
-     VALUES ($1, $2, $3, $4, $5)
+        (merchant_id, intent_log_id, shopify_order_id, transaction_token, gross_merchandise_value, currency)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (shopify_order_id) DO NOTHING
      RETURNING id, commission_fee, commission_rate, reconciled_at`,
-    [merchantId, intentId, shopifyOrderId, transactionToken, gmv]
+    [merchantId, intentId, shopifyOrderId, transactionToken, gmv, currency]
   );
 
   let result;
@@ -186,6 +197,109 @@ export async function insertReconciledOrder(db, { merchantId, intentLogId, shopi
     result = await insert(null);
   }
   return { inserted: (result.rowCount ?? 0) > 0, row: result.rows[0] ?? null };
+}
+
+/**
+ * Record one billing credit (refund/cancellation) against a reconciled order.
+ *
+ * Ledger write, never an UPDATE: the charge row stays immutable and
+ * statements net charges minus credits (see db migration 0008).
+ *
+ * Runs on ONE pinned client inside an explicit transaction because the
+ * over-credit clamp is read-modify-write: SELECT the parent FOR UPDATE,
+ * sum existing credits, then insert LEAST(requested, remaining). Without the
+ * row lock two concurrent webhooks (refund + cancellation racing) could both
+ * read the same "remaining" and credit more than the order ever billed.
+ * READ COMMITTED + FOR UPDATE is sufficient: the second transaction blocks on
+ * the parent lock and its later statements see the winner's committed credit.
+ *
+ * All money arithmetic happens IN SQL on NUMERIC — requested/remaining never
+ * transit JS floats.
+ *
+ * @param {object} db  must be the real src/db.js wrapper (withClient).
+ * @param {{merchantId: string, shopifyOrderId: string, sourceEventId: string,
+ *   kind: 'REFUND'|'CANCELLATION', requestedGmv: string|null}} adjustment
+ *   requestedGmv is a decimal string ("19.90"); null means "everything still
+ *   creditable" (the cancellation path).
+ * @returns {Promise<{status: 'credited'|'duplicate'|'order_not_found'|'nothing_remaining',
+ *   row: object|null}>}
+ */
+export async function insertOrderAdjustment(db, { merchantId, shopifyOrderId, sourceEventId, kind, requestedGmv }) {
+  return db.withClient(async (query) => {
+    try {
+      await query('BEGIN');
+
+      // Lock the charge row: serializes concurrent adjustments per order.
+      const parentResult = await query(
+        `SELECT id, commission_rate, gross_merchandise_value
+           FROM reconciled_agent_orders
+          WHERE merchant_id = $1 AND shopify_order_id = $2
+          FOR UPDATE`,
+        [merchantId, shopifyOrderId]
+      );
+      const parent = parentResult.rows[0];
+      if (!parent) {
+        // Order was never agent-attributed (human order refunded, or webhook
+        // for a foreign order) — nothing was billed, nothing to credit.
+        await query('ROLLBACK');
+        return { status: 'order_not_found', row: null };
+      }
+
+      // Clamp + insert in one statement; NUMERIC arithmetic only. COALESCE
+      // of a NULL request means "credit the full remainder" (cancellation).
+      const insertResult = await query(
+        `WITH already AS (
+            SELECT COALESCE(sum(adjusted_gmv), 0)::numeric(12,2) AS total
+              FROM order_adjustments
+             WHERE reconciled_order_id = $2
+         )
+         INSERT INTO order_adjustments
+            (merchant_id, reconciled_order_id, source_event_id, adjustment_kind,
+             adjusted_gmv, commission_rate)
+         SELECT $1, $2, $3, $4,
+                LEAST(COALESCE($5::numeric(12,2), $6::numeric(12,2) - already.total),
+                      $6::numeric(12,2) - already.total),
+                $7
+           FROM already
+          WHERE $6::numeric(12,2) - already.total > 0
+            AND COALESCE($5::numeric(12,2), $6::numeric(12,2) - already.total) > 0
+         ON CONFLICT (source_event_id) DO NOTHING
+         RETURNING id, adjusted_gmv, commission_credit, commission_rate, adjusted_at`,
+        [
+          merchantId,
+          parent.id,
+          sourceEventId,
+          kind,
+          requestedGmv,
+          parent.gross_merchandise_value,
+          parent.commission_rate,
+        ]
+      );
+
+      if ((insertResult.rowCount ?? 0) > 0) {
+        await query('COMMIT');
+        return { status: 'credited', row: insertResult.rows[0] };
+      }
+
+      // Zero rows: either the idempotency key already exists (webhook
+      // redelivery) or the order is already fully credited. Distinguish for
+      // honest logging; both are terminal no-ops for the caller.
+      const dup = await query(
+        `SELECT 1 FROM order_adjustments WHERE source_event_id = $1`,
+        [sourceEventId]
+      );
+      await query('COMMIT');
+      return { status: (dup.rowCount ?? 0) > 0 ? 'duplicate' : 'nothing_remaining', row: null };
+    } catch (err) {
+      // Roll back best-effort; the original error is the one that matters.
+      try {
+        await query('ROLLBACK');
+      } catch {
+        /* connection-level failure — release() discards the client */
+      }
+      throw err;
+    }
+  });
 }
 
 /**
@@ -297,10 +411,16 @@ export async function insertLossDiagnostic(
  * and estimated revenue lost. Scalar subqueries instead of joins — the three
  * tables aggregate independently and a join would multiply rows.
  *
+ * gmv/commission are GROSS (as charged); the adjustments pair reports what
+ * refunds/cancellations credited back in the same window, and net_* subtracts
+ * them IN SQL (NUMERIC arithmetic — money never floats in JS).
+ *
  * @param {object} db
  * @param {{windowDays: number}} options
  * @returns {Promise<{impressions: number, orders_won: number, gmv: string,
- *   commission: string, estimated_losses: string, losses: number}>}
+ *   commission: string, adjustments: number, adjusted_gmv: string,
+ *   commission_credits: string, net_gmv: string, net_commission: string,
+ *   estimated_losses: string, losses: number}>}
  */
 export async function getAnalyticsSummary(db, { windowDays }) {
   const result = await db.query(
@@ -313,6 +433,12 @@ export async function getAnalyticsSummary(db, { windowDays }) {
          WHERE reconciled_at >= now() - make_interval(days => $1))           AS gmv,
        (SELECT COALESCE(sum(commission_fee), 0) FROM reconciled_agent_orders
          WHERE reconciled_at >= now() - make_interval(days => $1))           AS commission,
+       (SELECT count(*) FROM order_adjustments
+         WHERE adjusted_at >= now() - make_interval(days => $1))             AS adjustments,
+       (SELECT COALESCE(sum(adjusted_gmv), 0) FROM order_adjustments
+         WHERE adjusted_at >= now() - make_interval(days => $1))             AS adjusted_gmv,
+       (SELECT COALESCE(sum(commission_credit), 0) FROM order_adjustments
+         WHERE adjusted_at >= now() - make_interval(days => $1))             AS commission_credits,
        (SELECT count(*) FROM loss_diagnostics
          WHERE created_at >= now() - make_interval(days => $1))              AS losses,
        (SELECT COALESCE(sum(estimated_revenue_lost), 0) FROM loss_diagnostics
@@ -320,11 +446,24 @@ export async function getAnalyticsSummary(db, { windowDays }) {
     [windowDays]
   );
   const row = result.rows[0];
+  // Net figures subtracted in SQL on the same NUMERIC values — JS float
+  // subtraction on money strings is banned. One extra round-trip is fine on
+  // a dashboard read path.
+  const netResult = await db.query(
+    `SELECT ($1::numeric - $2::numeric)::text AS net_gmv,
+            ($3::numeric - $4::numeric)::text AS net_commission`,
+    [row.gmv, row.adjusted_gmv, row.commission, row.commission_credits]
+  );
   return {
     impressions: Number(row.impressions),
     orders_won: Number(row.orders_won),
     gmv: String(row.gmv),
     commission: String(row.commission),
+    adjustments: Number(row.adjustments),
+    adjusted_gmv: String(row.adjusted_gmv),
+    commission_credits: String(row.commission_credits),
+    net_gmv: String(netResult.rows[0].net_gmv),
+    net_commission: String(netResult.rows[0].net_commission),
     losses: Number(row.losses),
     estimated_losses: String(row.estimated_losses),
   };
@@ -484,39 +623,84 @@ export async function getTrafficBreakdown(db, { windowDays }) {
 /**
  * Monthly commission billing statement (routes/analytics.js).
  *
- * reconciled_agent_orders is the billing source of truth (commission_fee is
- * the schema's generated column) — this query only aggregates it, per
- * merchant, for one calendar month. The month bound is a 'YYYY-MM-01'
- * string cast to date; half-open interval so month boundaries never
- * double-count an order.
+ * Nets the two ledgers per merchant PER CURRENCY (migration 0010: EUR and
+ * USD lines never sum together; legacy NULL currency renders UNSPECIFIED):
+ *   - charges: reconciled_agent_orders in the statement month (schema-
+ *     generated commission_fee — the billing source of truth),
+ *   - credits: order_adjustments whose adjustment happened in the statement
+ *     month, joined to their parent order for the currency. A January order
+ *     refunded in February credits February's statement (credits follow the
+ *     adjustment date, matching when the fee was actually collected).
+ * FULL OUTER JOIN: a month can be credits-only (order charged last month,
+ * refunded this month, no new orders) and must still produce a line.
+ *
+ * Month bound is a 'YYYY-MM-01' string cast to date; half-open interval so
+ * month boundaries never double-count.
  */
 export async function getBillingStatement(db, { monthStartDate }) {
   const result = await db.query(
-    `SELECT m.id AS merchant_id,
+    `WITH charges AS (
+        SELECT r.merchant_id,
+               COALESCE(r.currency, 'UNSPECIFIED') AS currency,
+               count(*)::bigint AS orders,
+               sum(r.gross_merchandise_value) AS gmv,
+               sum(r.commission_fee) AS commission,
+               -- rate snapshots can differ across rows after a rate change;
+               -- surface the range so statements stay explainable.
+               min(r.commission_rate) AS min_rate,
+               max(r.commission_rate) AS max_rate
+          FROM reconciled_agent_orders r
+         WHERE r.reconciled_at >= $1::date
+           AND r.reconciled_at < ($1::date + interval '1 month')
+         GROUP BY r.merchant_id, COALESCE(r.currency, 'UNSPECIFIED')
+     ),
+     credits AS (
+        SELECT a.merchant_id,
+               COALESCE(r.currency, 'UNSPECIFIED') AS currency,
+               count(*)::bigint AS adjustments,
+               sum(a.adjusted_gmv) AS adjusted_gmv,
+               sum(a.commission_credit) AS commission_credits
+          FROM order_adjustments a
+          JOIN reconciled_agent_orders r ON r.id = a.reconciled_order_id
+         WHERE a.adjusted_at >= $1::date
+           AND a.adjusted_at < ($1::date + interval '1 month')
+         GROUP BY a.merchant_id, COALESCE(r.currency, 'UNSPECIFIED')
+     )
+     SELECT m.id AS merchant_id,
             m.shopify_shop_domain,
-            count(*)::bigint AS orders,
-            sum(r.gross_merchandise_value) AS gmv,
-            sum(r.commission_fee) AS commission,
-            -- rate snapshots can differ across rows after a rate change;
-            -- surface the range so statements stay explainable.
-            min(r.commission_rate) AS min_rate,
-            max(r.commission_rate) AS max_rate
-       FROM reconciled_agent_orders r
-       JOIN merchant_profiles m ON m.id = r.merchant_id
-      WHERE r.reconciled_at >= $1::date
-        AND r.reconciled_at < ($1::date + interval '1 month')
-      GROUP BY m.id, m.shopify_shop_domain
-      ORDER BY sum(r.commission_fee) DESC`,
+            COALESCE(c.currency, cr.currency) AS currency,
+            COALESCE(c.orders, 0) AS orders,
+            COALESCE(c.gmv, 0) AS gmv,
+            COALESCE(c.commission, 0) AS commission,
+            COALESCE(cr.adjustments, 0) AS adjustments,
+            COALESCE(cr.adjusted_gmv, 0) AS adjusted_gmv,
+            COALESCE(cr.commission_credits, 0) AS commission_credits,
+            (COALESCE(c.gmv, 0) - COALESCE(cr.adjusted_gmv, 0)) AS net_gmv,
+            (COALESCE(c.commission, 0) - COALESCE(cr.commission_credits, 0)) AS net_commission,
+            c.min_rate AS min_rate,
+            c.max_rate AS max_rate
+       FROM charges c
+       FULL OUTER JOIN credits cr
+         ON cr.merchant_id = c.merchant_id AND cr.currency = c.currency
+       JOIN merchant_profiles m ON m.id = COALESCE(c.merchant_id, cr.merchant_id)
+      ORDER BY (COALESCE(c.commission, 0) - COALESCE(cr.commission_credits, 0)) DESC`,
     [monthStartDate]
   );
   return result.rows.map((row) => ({
     merchant_id: row.merchant_id,
     shop_domain: row.shopify_shop_domain,
+    currency: row.currency,
     orders: Number(row.orders),
     gmv: String(row.gmv),
     commission: String(row.commission),
-    min_rate: String(row.min_rate),
-    max_rate: String(row.max_rate),
+    adjustments: Number(row.adjustments),
+    adjusted_gmv: String(row.adjusted_gmv),
+    commission_credits: String(row.commission_credits),
+    net_gmv: String(row.net_gmv),
+    net_commission: String(row.net_commission),
+    // NULL on credits-only lines (no charges this month to snapshot from).
+    min_rate: row.min_rate === null ? null : String(row.min_rate),
+    max_rate: row.max_rate === null ? null : String(row.max_rate),
   }));
 }
 

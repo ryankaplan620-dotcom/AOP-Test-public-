@@ -255,3 +255,29 @@ test('records the edge redactor fail-safe sentinel (-1) but rejects nonsense cou
   assert.equal(nonsense.ok, true);
   assert.equal(nonsense.value.payload?._edge?.pii_redactions, undefined);
 });
+
+// ---------------------------------------------------------------------------
+// event_id — the ingest idempotency key (db migration 0009).
+// ---------------------------------------------------------------------------
+
+test('a valid event_id passes through lowercased (idempotency key)', () => {
+  const verdict = validateTelemetryRecord(
+    wireRecord({ event_id: 'A3E9C1D2-4B5F-4a6b-8C7D-0E1F2A3B4C5D' })
+  );
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.value.eventId, 'a3e9c1d2-4b5f-4a6b-8c7d-0e1f2a3b4c5d');
+});
+
+test('missing event_id degrades to null (pre-0009 edge builds keep ingesting)', () => {
+  const verdict = validateTelemetryRecord(wireRecord());
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.value.eventId, null);
+});
+
+test('malformed event_id degrades to null instead of rejecting shipped telemetry', () => {
+  for (const bad of ['not-a-uuid', 42, '', '   ', {}, [], 'a3e9c1d24b5f4a6b8c7d0e1f2a3b4c5d']) {
+    const verdict = validateTelemetryRecord(wireRecord({ event_id: bad }));
+    assert.equal(verdict.ok, true, `record with event_id=${JSON.stringify(bad)} must still ingest`);
+    assert.equal(verdict.value.eventId, null);
+  }
+});

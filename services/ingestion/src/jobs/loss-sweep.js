@@ -50,16 +50,32 @@ export const SWEEP_BATCH_SIZE = 200;
  *   runOnce is exposed for observability/testing; stop() halts the interval
  *   and resolves after any in-flight sweep completes.
  */
+/**
+ * Advisory-lock key for this job (arbitrary but stable across replicas —
+ * the value only has to be unique among AOP's jobs; see retention-sweep).
+ */
+export const LOSS_SWEEP_LOCK_KEY = 815001;
+
 export function startLossSweep({ db, config, logger }) {
   let running = false; // overlap guard
   let stopped = false;
   let inFlight = Promise.resolve(); // last sweep's promise, awaited by stop()
 
+  // Cross-REPLICA guard, complementing the in-process `running` flag: with
+  // horizontally scaled ingestion, only the replica that wins the advisory
+  // lock sweeps this tick; the SQL is idempotent anyway (ON CONFLICT), so
+  // the lock removes wasted duplicate work rather than preventing
+  // corruption. Fakes without withAdvisoryLock (unit tests) run unguarded.
+  const withLock =
+    typeof db.withAdvisoryLock === 'function'
+      ? (fn) => db.withAdvisoryLock(LOSS_SWEEP_LOCK_KEY, fn)
+      : async (fn) => ({ ran: true, result: await fn() });
+
   /**
    * One sweep pass: fetch -> classify -> insert, with per-row isolation.
    * Never rejects: every failure path is caught and logged.
    */
-  async function runOnce() {
+  async function sweepPass() {
     const summary = { fetched: 0, diagnosed: 0, conflicts: 0, rowErrors: 0 };
     let rows;
     try {
@@ -117,6 +133,24 @@ export function startLossSweep({ db, config, logger }) {
       logger.info('loss sweep completed', summary);
     }
     return summary;
+  }
+
+  /**
+   * Lock-guarded pass. Never rejects: a failed lock checkout (pool
+   * exhausted, DB down) is logged and the interval retries.
+   */
+  async function runOnce() {
+    try {
+      const { ran, result } = await withLock(sweepPass);
+      if (!ran) {
+        logger.info('loss sweep skipped: another replica holds the advisory lock');
+        return { fetched: 0, diagnosed: 0, conflicts: 0, rowErrors: 0, skipped: true };
+      }
+      return result;
+    } catch (err) {
+      logger.error('loss sweep could not acquire/release the advisory lock; will retry next tick', { err });
+      return { fetched: 0, diagnosed: 0, conflicts: 0, rowErrors: 0, skipped: true };
+    }
   }
 
   /** Interval tick: skip when a sweep is already in flight. */

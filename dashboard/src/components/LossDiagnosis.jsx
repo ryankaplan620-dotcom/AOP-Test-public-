@@ -105,7 +105,8 @@ export default function LossDiagnosis({ settings }) {
           value={summary ? formatCount(summary.orders_won) : '…'}
           note={
             summary
-              ? `Conv. rate: ${formatPct(summary.conversion_rate_pct)} · GMV ${formatMoney(summary.gmv)}`
+              ? `Conv. rate: ${formatPct(summary.conversion_rate_pct)} · Net GMV ${formatMoney(summary.net_gmv ?? summary.gmv)}` +
+                (summary.adjustments > 0 ? ` (${formatCount(summary.adjustments)} refunds/cancels)` : '')
               : ''
           }
         />

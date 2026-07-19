@@ -18,6 +18,7 @@
  */
 
 import express from 'express';
+import { buildRateLimiter } from './lib/rate-limit.js';
 import { buildTelemetryRouter } from './routes/telemetry.js';
 import { buildWebhooksRouter } from './routes/webhooks.js';
 import { buildAnalyticsRouter } from './routes/analytics.js';
@@ -34,8 +35,19 @@ export function buildApp({ config, db, logger }) {
   // Header hygiene: no framework fingerprinting for whoever port-scans us.
   app.disable('x-powered-by');
   // Behind Cloudflare/ALB in production; trust one proxy hop so req.ip is the
-  // real client for log forensics (never used for auth decisions).
+  // real client for log forensics and rate-limit bucketing (never for auth).
   app.set('trust proxy', 1);
+
+  // ---- 0. Abuse bound (before body parsing: floods are rejected before we
+  // buffer their bytes). /healthz is exempt — LB probes must never 429.
+  const rateLimiter = buildRateLimiter({ limitPerMinute: config.rateLimitPerMinute });
+  app.use((req, res, next) => {
+    if (req.path === '/healthz') {
+      next();
+      return;
+    }
+    rateLimiter(req, res, next);
+  });
 
   // ---- 1. RAW-body webhook route (BEFORE any JSON parsing — see header) --
   app.use('/webhooks', buildWebhooksRouter({ config, db, logger: logger.child('webhooks') }));

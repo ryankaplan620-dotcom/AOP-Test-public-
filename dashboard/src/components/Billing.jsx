@@ -1,12 +1,13 @@
 /**
  * Billing.jsx — monthly commission statements.
  *
- * Role in the AOP data flow: renders GET /analytics/billing — per-merchant
- * statement lines for one calendar month (orders reconciled, GMV, the 0.5%
- * commission computed by the database's generated column) plus totals. The
- * numbers here ARE the billing truth: they aggregate
- * reconciled_agent_orders.commission_fee, which no application code can
- * write directly.
+ * Role in the AOP data flow: renders GET /analytics/billing — statement
+ * lines per (merchant, currency) for one calendar month: orders reconciled,
+ * GMV, the 0.5% commission computed by the database's generated column,
+ * minus refund/cancellation credits from the order_adjustments ledger —
+ * plus per-currency totals. The numbers here ARE the billing truth: they
+ * aggregate schema-generated commission_fee/commission_credit columns,
+ * which no application code can write directly.
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
@@ -65,7 +66,8 @@ export default function Billing({ settings }) {
         <h2>Commission statement — {statement?.month ?? month}</h2>
         <p className="sub">
           Flat 0.5% of reconciled agent-driven GMV, computed by the database schema (generated
-          column) — these figures are the billing source of truth.
+          columns), net of refund/cancellation credits — these figures are the billing source of
+          truth. Lines are per merchant per currency; different currencies never sum together.
         </p>
         {statement && statement.lines.length > 0 ? (
           <>
@@ -73,33 +75,54 @@ export default function Billing({ settings }) {
               <thead>
                 <tr>
                   <th>Merchant</th>
+                  <th>Currency</th>
                   <th className="num">Orders</th>
-                  <th className="num">Reconciled GMV</th>
+                  <th className="num">Gross GMV</th>
+                  <th className="num">Refunded</th>
                   <th className="num">Rate</th>
                   <th className="num">Commission</th>
+                  <th className="num">Credits</th>
+                  <th className="num">Net commission</th>
                 </tr>
               </thead>
               <tbody>
                 {statement.lines.map((line) => (
-                  <tr key={line.merchant_id}>
+                  <tr key={`${line.merchant_id}:${line.currency}`}>
                     <td>{line.shop_domain}</td>
+                    <td>{line.currency}</td>
                     <td className="num">{formatCount(line.orders)}</td>
-                    <td className="num">{formatMoney(line.gmv)}</td>
+                    <td className="num">{formatMoney(line.gmv, line.currency)}</td>
+                    <td className="num">{formatMoney(line.adjusted_gmv, line.currency)}</td>
                     <td className="num">
-                      {line.min_rate === line.max_rate
-                        ? `${(Number(line.min_rate) * 100).toFixed(2)}%`
-                        : `${(Number(line.min_rate) * 100).toFixed(2)}–${(Number(line.max_rate) * 100).toFixed(2)}%`}
+                      {line.min_rate === null
+                        ? '—'
+                        : line.min_rate === line.max_rate
+                          ? `${(Number(line.min_rate) * 100).toFixed(2)}%`
+                          : `${(Number(line.min_rate) * 100).toFixed(2)}–${(Number(line.max_rate) * 100).toFixed(2)}%`}
                     </td>
-                    <td className="num">{formatMoney(line.commission)}</td>
+                    <td className="num">{formatMoney(line.commission, line.currency)}</td>
+                    <td className="num">{formatMoney(line.commission_credits, line.currency)}</td>
+                    <td className="num" style={{ fontWeight: 700 }}>
+                      {formatMoney(line.net_commission, line.currency)}
+                    </td>
                   </tr>
                 ))}
-                <tr style={{ borderTop: '2px solid var(--accent)', fontWeight: 700 }}>
-                  <td>Total</td>
-                  <td className="num">{formatCount(statement.totals.orders)}</td>
-                  <td className="num">{formatMoney(statement.totals.gmv)}</td>
-                  <td className="num" />
-                  <td className="num">{formatMoney(statement.totals.commission)}</td>
-                </tr>
+                {(statement.totals ?? []).map((total) => (
+                  <tr
+                    key={`total:${total.currency}`}
+                    style={{ borderTop: '2px solid var(--accent)', fontWeight: 700 }}
+                  >
+                    <td>Total</td>
+                    <td>{total.currency}</td>
+                    <td className="num">{formatCount(total.orders)}</td>
+                    <td className="num">{formatMoney(total.gmv, total.currency)}</td>
+                    <td className="num">{formatMoney(total.adjusted_gmv, total.currency)}</td>
+                    <td className="num" />
+                    <td className="num">{formatMoney(total.commission, total.currency)}</td>
+                    <td className="num">{formatMoney(total.commission_credits, total.currency)}</td>
+                    <td className="num">{formatMoney(total.net_commission, total.currency)}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </>

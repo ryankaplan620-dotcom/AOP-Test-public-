@@ -165,6 +165,7 @@ export function buildTelemetryRouter({ config, db, logger }) {
           path: verdict.value.path,
           targetSku: verdict.value.targetSku,
           payload: verdict.value.payload,
+          eventId: verdict.value.eventId,
         });
       }
 

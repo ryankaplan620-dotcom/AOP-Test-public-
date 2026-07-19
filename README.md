@@ -17,7 +17,9 @@ headless Shopify/BigCommerce backend. It:
   captured at the edge is stitched to Shopify `orders/create` webhooks, reconciling
   agent-driven orders and computing the platform's flat **0.5% commission on
   reconciled GMV** (enforced by a database generated column — billing math lives in
-  the schema, not app code).
+  the schema, not app code). `refunds/create` and `orders/cancelled` webhooks feed
+  an immutable credit ledger (`order_adjustments`), so statements bill **net of
+  refunds**, per merchant per currency.
 - **Diagnoses losses** — intents that expire without a conversion inside the
   60-second window are classified (`PRICE_DISCREPANCY`, `SHIPPING_LATENCY`,
   `STOCK_OUTAGE`, `POLICY_AMBIGUITY`, `PROTOCOL_ERROR`, `UNKNOWN_DROPOFF`) into a
@@ -35,7 +37,7 @@ flowchart LR
     W -.->|ctx.waitUntil telemetry| Q[(Cloudflare Queue<br/>aop-edge-telemetry)]
     Q --> C[queue consumer<br/>same worker]
     C -->|POST /ingest/telemetry| I[Node.js ingestion service]
-    S -->|orders/create webhook| I
+    S -->|orders/create + refunds/create + orders/cancelled webhooks| I
     I --> P[(PostgreSQL)]
     P --> O[Python optimizer<br/>aop_optimizer]
 ```
@@ -130,6 +132,7 @@ cd db && node --check migrate.mjs            # runner syntax; SQL verified again
 | `LOSS_SWEEP_INTERVAL_MS` | ingestion | Loss-sweep cadence (default `15000`) |
 | `RETENTION_DAYS` | ingestion | Telemetry retention cap enforced in-process (default `90`) |
 | `RETENTION_SWEEP_INTERVAL_MS` | ingestion | Retention purge cadence (default `21600000` = 6h) |
+| `RATE_LIMIT_PER_MINUTE` | ingestion | Per-IP request cap per minute, per replica (default `600`; `0` disables) |
 | `MERCHANT_ROUTES` | edge (`[vars]`) | JSON map: proxy hostname → merchant origin base URL |
 | `DEFAULT_ORIGIN` | edge (`[vars]`) | Fallback origin; empty = 502 unknown hostnames |
 | `INGEST_API_URL` | edge (`[vars]`) | Base URL of the ingestion service (also the dynamic-routing resolve host) |
