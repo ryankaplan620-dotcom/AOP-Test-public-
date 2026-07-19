@@ -42,7 +42,7 @@ jobs:
       # plain Node (env/ctx stubbed, globalThis.fetch monkeypatched).
       - name: Syntax check
         working-directory: edge
-        run: find src -name '*.js' -exec node --check {} \;
+        run: find src -name '*.js' -exec node --check {} +
       - name: Test
         working-directory: edge
         run: npm test
@@ -65,7 +65,7 @@ jobs:
       # pure test suite, so this is what catches syntax errors in them).
       - name: Syntax check
         working-directory: services/ingestion
-        run: find src -name '*.js' -exec node --check {} \;
+        run: find src -name '*.js' -exec node --check {} +
       - name: Test
         working-directory: services/ingestion
         run: npm test
@@ -186,7 +186,7 @@ jobs:
           BEGIN
             SELECT commission_fee INTO fee FROM reconciled_agent_orders
              WHERE shopify_order_id = 'ci-order-1';
-            IF fee <> 6.17 THEN
+            IF fee IS DISTINCT FROM 6.17 THEN
               RAISE EXCEPTION 'commission_fee % != expected 6.17', fee;
             END IF;
             RAISE NOTICE 'generated commission_fee = % (ok)', fee;
@@ -216,7 +216,7 @@ jobs:
             SELECT commission_credit INTO credit FROM order_adjustments
              WHERE source_event_id = 'refund:ci-1';
             -- 200.00 * 0.005 = 1.00
-            IF credit <> 1.00 THEN
+            IF credit IS DISTINCT FROM 1.00 THEN
               RAISE EXCEPTION 'commission_credit % != expected 1.00', credit;
             END IF;
             RAISE NOTICE 'generated commission_credit = % (ok)', credit;
@@ -252,7 +252,7 @@ jobs:
           BEGIN
             SELECT count(*) INTO n FROM agent_intent_logs
              WHERE event_id = 'ffffffff-1111-2222-3333-444444444444';
-            IF n <> 1 THEN
+            IF n IS DISTINCT FROM 1 THEN
               RAISE EXCEPTION 'event_id dedup failed: % rows', n;
             END IF;
             RAISE NOTICE 'event_id dedup enforced (ok)';

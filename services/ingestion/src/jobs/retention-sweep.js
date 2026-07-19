@@ -48,22 +48,36 @@ export function startRetentionSweep({ db, config, logger }) {
       : async (fn) => ({ ran: true, result: await fn() });
 
   async function purgePass() {
-    const summary = { intents_deleted: 0, failed: false };
+    const summary = { intents_deleted: 0, batches: 0, failed: false };
+    // The SQL function deletes ONE ctid-batch per call (migration 0012) and
+    // THIS loop drains the backlog: every iteration is its own statement /
+    // transaction, so no backlog size can ever hit statement_timeout, and
+    // batches already deleted stay deleted if a later one fails. (The 0006
+    // version looped inside one plpgsql call = one 15s-bounded transaction —
+    // any real backlog rolled back wholesale, forever.)
     try {
-      const result = await db.query('SELECT * FROM purge_expired_telemetry($1, $2)', [
-        config.retentionDays,
-        PURGE_BATCH_SIZE,
-      ]);
-      summary.intents_deleted = Number(result.rows[0]?.intents_deleted ?? 0);
+      for (;;) {
+        if (stopped) break; // shutdown: finish mid-backlog gracefully
+        const result = await db.query('SELECT * FROM purge_expired_telemetry($1, $2)', [
+          config.retentionDays,
+          PURGE_BATCH_SIZE,
+        ]);
+        const deleted = Number(result.rows[0]?.intents_deleted ?? 0);
+        summary.intents_deleted += deleted;
+        summary.batches += 1;
+        if (deleted < PURGE_BATCH_SIZE) break; // backlog drained
+      }
       if (summary.intents_deleted > 0) {
         logger.info('retention purge completed', {
           intents_deleted: summary.intents_deleted,
+          batches: summary.batches,
           retention_days: config.retentionDays,
         });
       }
     } catch (err) {
-      // DB down or migration 0006 not applied — log loudly, retry next tick.
+      // DB down or migration not applied — log loudly, retry next tick.
       // The cap is a compliance obligation: silence here would hide drift.
+      // Batches deleted before the failure remain deleted (progress holds).
       summary.failed = true;
       logger.error('retention purge failed; will retry next tick', { err });
     }

@@ -75,10 +75,17 @@ async function request(url, { method = 'GET', token = null, body = null } = {}) 
   try {
     payload = await response.json();
   } catch {
-    /* non-JSON error body — fall through to the status-based message */
+    /* non-JSON body — fall through; the checks below decide */
   }
   if (!response.ok) {
     throw new Error(payload?.error ?? `HTTP ${response.status}`);
+  }
+  // A 2xx with a non-JSON or non-object body (proxy splash page, empty 200)
+  // must be an ERROR, not a silently-resolved null/string — callers would
+  // either spin on 'Loading…' forever or crash rendering it. This honors
+  // the module contract: every failure becomes a renderable Error.
+  if (payload === null || typeof payload !== 'object') {
+    throw new Error('Malformed response from server (expected JSON object)');
   }
   return payload;
 }

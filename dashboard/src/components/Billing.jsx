@@ -10,7 +10,7 @@
  * which no application code can write directly.
  */
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchBilling } from '../api.js';
 import { formatCount, formatMoney } from '../format.js';
 
@@ -29,12 +29,20 @@ export default function Billing({ settings }) {
   const [month, setMonth] = useState(recentMonths()[0]);
   const [statement, setStatement] = useState(null);
   const [error, setError] = useState(null);
+  // Stale-response guard: switching months fires overlapping fetches, and a
+  // slow older response must never overwrite a newer selection's data (this
+  // tab has no poll to self-heal — the wrong statement would stick).
+  const requestSeq = useRef(0);
 
   const refresh = useCallback(async () => {
+    const seq = ++requestSeq.current;
     try {
-      setStatement(await fetchBilling(settings, month));
+      const next = await fetchBilling(settings, month);
+      if (seq !== requestSeq.current) return; // superseded by a newer request
+      setStatement(next);
       setError(null);
     } catch (err) {
+      if (seq !== requestSeq.current) return;
       setError(err.message);
     }
   }, [settings, month]);
@@ -42,6 +50,10 @@ export default function Billing({ settings }) {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Older (pre-adjustments) services return totals as an OBJECT; rendering
+  // must tolerate both shapes rather than blank-page the whole SPA on .map.
+  const totals = Array.isArray(statement?.totals) ? statement.totals : [];
 
   return (
     <div>
@@ -107,7 +119,7 @@ export default function Billing({ settings }) {
                     </td>
                   </tr>
                 ))}
-                {(statement.totals ?? []).map((total) => (
+                {totals.map((total) => (
                   <tr
                     key={`total:${total.currency}`}
                     style={{ borderTop: '2px solid var(--accent)', fontWeight: 700 }}

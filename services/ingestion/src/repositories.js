@@ -160,6 +160,10 @@ export async function insertIntentLogsBatch(db, rows) {
  * @returns {Promise<object|null>} full intent row or null.
  */
 export async function findLatestIntentByToken(db, merchantId, transactionToken) {
+  // The anonymous sentinel is shared by EVERY un-tokenized agent — stitching
+  // an order to "the latest anonymous intent" would attribute it to an
+  // arbitrary unrelated session. Such orders reconcile on the token alone.
+  if (transactionToken === 'headless_anonymous') return null;
   const result = await db.query(
     `SELECT i.id, i.merchant_id, i.transaction_token, i.protocol_type,
             i.request_method, i.endpoint_path, i.target_sku, i.inbound_payload,
@@ -252,20 +256,24 @@ export async function insertReconciledOrder(db, { merchantId, intentLogId, shopi
  *
  * @param {object} db  must be the real src/db.js wrapper (withClient).
  * @param {{merchantId: string, shopifyOrderId: string, sourceEventId: string,
- *   kind: 'REFUND'|'CANCELLATION', requestedGmv: string|null}} adjustment
+ *   kind: 'REFUND'|'CANCELLATION', requestedGmv: string|null,
+ *   requestedCurrency?: string|null}} adjustment
  *   requestedGmv is a decimal string ("19.90"); null means "everything still
- *   creditable" (the cancellation path).
- * @returns {Promise<{status: 'credited'|'duplicate'|'order_not_found'|'nothing_remaining',
+ *   creditable" (the cancellation path). requestedCurrency (when known) must
+ *   match the charged order's currency — crediting a presentment-currency
+ *   refund amount against shop-currency GMV would be silent wrong math, so a
+ *   mismatch is refused loudly instead ('currency_mismatch').
+ * @returns {Promise<{status: 'credited'|'duplicate'|'order_not_found'|'nothing_remaining'|'currency_mismatch',
  *   row: object|null}>}
  */
-export async function insertOrderAdjustment(db, { merchantId, shopifyOrderId, sourceEventId, kind, requestedGmv }) {
+export async function insertOrderAdjustment(db, { merchantId, shopifyOrderId, sourceEventId, kind, requestedGmv, requestedCurrency = null }) {
   return db.withClient(async (query) => {
     try {
       await query('BEGIN');
 
       // Lock the charge row: serializes concurrent adjustments per order.
       const parentResult = await query(
-        `SELECT id, commission_rate, gross_merchandise_value
+        `SELECT id, commission_rate, gross_merchandise_value, currency
            FROM reconciled_agent_orders
           WHERE merchant_id = $1 AND shopify_order_id = $2
           FOR UPDATE`,
@@ -273,10 +281,23 @@ export async function insertOrderAdjustment(db, { merchantId, shopifyOrderId, so
       );
       const parent = parentResult.rows[0];
       if (!parent) {
-        // Order was never agent-attributed (human order refunded, or webhook
-        // for a foreign order) — nothing was billed, nothing to credit.
+        // The order's own webhook has not arrived yet (Shopify does not
+        // order deliveries across topics) OR it was never agent-attributed.
+        // The caller parks the credit in order_adjustment_orphans and
+        // replays it if/when the order reconciles.
         await query('ROLLBACK');
         return { status: 'order_not_found', row: null };
+      }
+
+      if (
+        requestedCurrency !== null &&
+        parent.currency !== null &&
+        requestedCurrency !== parent.currency
+      ) {
+        // Never net across currencies. Visible refusal beats silent wrong
+        // arithmetic; the operator reconciles this one by hand.
+        await query('ROLLBACK');
+        return { status: 'currency_mismatch', row: null };
       }
 
       // Clamp + insert in one statement; NUMERIC arithmetic only. COALESCE
@@ -337,6 +358,63 @@ export async function insertOrderAdjustment(db, { merchantId, shopifyOrderId, so
 }
 
 /**
+ * Park a credit whose order has not been reconciled yet (migration 0012).
+ * ON CONFLICT: webhook redelivery of an already-parked credit is a no-op.
+ * @returns {Promise<{inserted: boolean}>}
+ */
+export async function insertAdjustmentOrphan(
+  db,
+  { merchantId, shopifyOrderId, sourceEventId, kind, requestedGmv, requestedCurrency }
+) {
+  const result = await db.query(
+    `INSERT INTO order_adjustment_orphans
+        (merchant_id, shopify_order_id, source_event_id, adjustment_kind,
+         requested_gmv, requested_currency)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (source_event_id) DO NOTHING`,
+    [merchantId, shopifyOrderId, sourceEventId, kind, requestedGmv, requestedCurrency]
+  );
+  return { inserted: (result.rowCount ?? 0) > 0 };
+}
+
+/**
+ * Orphans waiting on one order, oldest first (replay order matters: partial
+ * refunds should consume the clamp before a trailing cancellation).
+ */
+export async function findAdjustmentOrphansForOrder(db, { merchantId, shopifyOrderId }) {
+  const result = await db.query(
+    `SELECT id, source_event_id, adjustment_kind, requested_gmv, requested_currency
+       FROM order_adjustment_orphans
+      WHERE merchant_id = $1 AND shopify_order_id = $2
+      ORDER BY received_at ASC`,
+    [merchantId, shopifyOrderId]
+  );
+  return result.rows;
+}
+
+/** Remove a replayed (or terminally refused) orphan. */
+export async function deleteAdjustmentOrphan(db, orphanId) {
+  await db.query(`DELETE FROM order_adjustment_orphans WHERE id = $1`, [orphanId]);
+}
+
+/**
+ * Reverse the false LOST verdict when an intent converts AFTER the expiry
+ * window (slow human-assisted checkout, delayed webhook): the sweep already
+ * wrote a loss_diagnostics row, and leaving it makes every slow conversion
+ * permanently double-counted as both LOST and WON in every aggregate.
+ * Called by the webhook flow right after a successful reconciliation.
+ * @returns {Promise<{deleted: number}>}
+ */
+export async function deleteLossDiagnosticForIntent(db, intentLogId) {
+  if (intentLogId === null || intentLogId === undefined) return { deleted: 0 };
+  const result = await db.query(
+    `DELETE FROM loss_diagnostics WHERE intent_log_id = $1`,
+    [intentLogId]
+  );
+  return { deleted: result.rowCount ?? 0 };
+}
+
+/**
  * The sweep query: intents whose conversion window has expired and that
  * neither converted nor were already diagnosed.
  *
@@ -344,7 +422,10 @@ export async function insertOrderAdjustment(db, { merchantId, shopifyOrderId, so
  *   - no reconciled order referencing the intent row directly (intent_log_id),
  *   - no reconciled order matching the intent's token FOR THE SAME MERCHANT
  *     (token matching is how late webhooks reconcile; merchant scoping stops
- *     the shared anonymous sentinel from suppressing other tenants' losses),
+ *     the shared anonymous sentinel from suppressing other tenants' losses).
+ *     SKIPPED for the anonymous sentinel: 'headless_anonymous' is shared by
+ *     every un-tokenized agent, so a single sentinel order would otherwise
+ *     suppress ALL anonymous drop-offs for that merchant forever,
  *   - no existing loss_diagnostics row (idempotency: re-scanning a window
  *     after a crash must not re-fetch already-diagnosed intents; the UNIQUE
  *     constraint on loss_diagnostics.intent_log_id is the schema-level
@@ -359,7 +440,18 @@ export async function insertOrderAdjustment(db, { merchantId, shopifyOrderId, so
  *     Tie-break on (processed_at, id): probes of one session batched into a
  *     single multi-row INSERT share the transaction's now(), so timestamp
  *     alone cannot order them; the row-tuple comparison guarantees exactly
- *     one winner per token either way.
+ *     one winner per token either way. ALSO skipped for the anonymous
+ *     sentinel — distinct anonymous agents are not one session, and under
+ *     steady traffic there is always a newer sentinel row, which would
+ *     defer every anonymous diagnosis forever.
+ *
+ * Watermark bound (sweep_state, migration 0012): the anti-joins exclude
+ * already-diagnosed rows from the RESULT, but without a lower bound the scan
+ * still VISITS the whole retention window oldest-first on every tick — at
+ * firehose scale that outgrows statement_timeout and the sweep dies. The
+ * caller passes the persisted watermark; rows below it are already fully
+ * processed (diagnosed, reconciled, or skipped-with-error and retried before
+ * the watermark advanced — see jobs/loss-sweep.js advancement rules).
  *
  * make_interval(secs => $1) keeps the expiry window parameterized — no
  * interval string concatenation.
@@ -368,36 +460,65 @@ export async function insertOrderAdjustment(db, { merchantId, shopifyOrderId, so
  * before the batch LIMIT cuts off, so no intent starves indefinitely.
  *
  * @param {object} db
- * @param {{expirySeconds: number, limit: number}} options
+ * @param {{expirySeconds: number, limit: number, watermark?: string|null}} options
+ *   watermark: ISO timestamp lower bound (inclusive); null scans from the start.
  * @returns {Promise<object[]>} expired, unreconciled, undiagnosed intent rows.
  */
-export async function findExpiredUnreconciledIntents(db, { expirySeconds, limit }) {
+export async function findExpiredUnreconciledIntents(db, { expirySeconds, limit, watermark = null }) {
   const result = await db.query(
     `SELECT i.id, i.merchant_id, i.transaction_token, i.protocol_type,
             i.request_method, i.endpoint_path, i.target_sku, i.inbound_payload,
             i.processed_at
        FROM agent_intent_logs i
       WHERE i.processed_at < now() - make_interval(secs => $1)
+        AND ($3::timestamptz IS NULL OR i.processed_at >= $3::timestamptz)
         AND NOT EXISTS (
               SELECT 1 FROM reconciled_agent_orders r
                WHERE r.intent_log_id = i.id)
-        AND NOT EXISTS (
+        AND (i.transaction_token = 'headless_anonymous' OR NOT EXISTS (
               SELECT 1 FROM reconciled_agent_orders r
                WHERE r.transaction_token = i.transaction_token
-                 AND r.merchant_id = i.merchant_id)
+                 AND r.merchant_id = i.merchant_id))
         AND NOT EXISTS (
               SELECT 1 FROM loss_diagnostics d
                WHERE d.intent_log_id = i.id)
-        AND NOT EXISTS (
+        AND (i.transaction_token = 'headless_anonymous' OR NOT EXISTS (
               SELECT 1 FROM agent_intent_logs newer
                WHERE newer.merchant_id = i.merchant_id
                  AND newer.transaction_token = i.transaction_token
-                 AND (newer.processed_at, newer.id) > (i.processed_at, i.id))
+                 AND (newer.processed_at, newer.id) > (i.processed_at, i.id)))
       ORDER BY i.processed_at ASC
       LIMIT $2`,
-    [expirySeconds, limit]
+    [expirySeconds, limit, watermark]
   );
   return result.rows;
+}
+
+/**
+ * Sweep watermark persistence (sweep_state, migration 0012).
+ * getSweepWatermark returns the ISO watermark or null (first run).
+ */
+export async function getSweepWatermark(db, jobName) {
+  const result = await db.query(
+    `SELECT watermark FROM sweep_state WHERE job_name = $1`,
+    [jobName]
+  );
+  return result.rows[0]?.watermark ?? null;
+}
+
+/**
+ * Advance (never regress) a job's watermark. GREATEST keeps a stale replica
+ * from moving the frontier backwards.
+ */
+export async function setSweepWatermark(db, jobName, watermark) {
+  await db.query(
+    `INSERT INTO sweep_state (job_name, watermark)
+     VALUES ($1, $2)
+     ON CONFLICT (job_name)
+     DO UPDATE SET watermark = GREATEST(sweep_state.watermark, EXCLUDED.watermark),
+                   updated_at = now()`,
+    [jobName, watermark]
+  );
 }
 
 /**
@@ -491,14 +612,26 @@ export async function getAnalyticsSummary(db, { windowDays }) {
            GROUP BY COALESCE(currency, 'UNSPECIFIED')
        ),
        credits AS (
-          SELECT COALESCE(r.currency, 'UNSPECIFIED') AS currency,
-                 count(*)::bigint AS adjustments,
-                 sum(a.adjusted_gmv) AS adjusted_gmv,
-                 sum(a.commission_credit) AS commission_credits
-            FROM order_adjustments a
-            JOIN reconciled_agent_orders r ON r.id = a.reconciled_order_id
-           WHERE a.adjusted_at >= now() - make_interval(days => $1)
-           GROUP BY COALESCE(r.currency, 'UNSPECIFIED')
+          -- Per-order lifetime clamp, same construction as the billing
+          -- statement: recognized credits can never exceed the order's fee
+          -- even when per-adjustment rounding sums past it.
+          SELECT oc.currency,
+                 sum(oc.win_count)::bigint AS adjustments,
+                 sum(oc.win_gmv) AS adjusted_gmv,
+                 sum(LEAST(oc.total_credit, oc.commission_fee)
+                     - LEAST(oc.prior_credit, oc.commission_fee)) AS commission_credits
+            FROM (
+              SELECT r.id, COALESCE(r.currency, 'UNSPECIFIED') AS currency, r.commission_fee,
+                     count(*) FILTER (WHERE a.adjusted_at >= now() - make_interval(days => $1)) AS win_count,
+                     COALESCE(sum(a.adjusted_gmv) FILTER (WHERE a.adjusted_at >= now() - make_interval(days => $1)), 0) AS win_gmv,
+                     COALESCE(sum(a.commission_credit), 0) AS total_credit,
+                     COALESCE(sum(a.commission_credit) FILTER (WHERE a.adjusted_at < now() - make_interval(days => $1)), 0) AS prior_credit
+                FROM order_adjustments a
+                JOIN reconciled_agent_orders r ON r.id = a.reconciled_order_id
+               GROUP BY r.id, COALESCE(r.currency, 'UNSPECIFIED'), r.commission_fee
+              HAVING count(*) FILTER (WHERE a.adjusted_at >= now() - make_interval(days => $1)) > 0
+            ) oc
+           GROUP BY oc.currency
        )
        SELECT COALESCE(c.currency, cr.currency) AS currency,
               COALESCE(c.orders, 0) AS orders,
@@ -711,8 +844,23 @@ export async function getTrafficBreakdown(db, { windowDays }) {
  * month boundaries never double-count.
  */
 export async function getBillingStatement(db, { monthStartDate }) {
+  // Month bounds pinned to UTC explicitly: comparing a timestamptz against a
+  // bare ::date resolves through the SERVER's TimeZone setting, silently
+  // shifting statement boundaries (and disagreeing with the UTC month label
+  // and the dashboard's UTC picker) on any non-UTC server.
+  //
+  // Credits clamp per ORDER, lifetime-aware: per-adjustment rounding of
+  // commission_credit can sum past the order's charged commission_fee (the
+  // GMV clamp bounds gmv, not rounded fees). Each order's credit recognized
+  // in this month is LEAST(lifetime credits, fee) minus what was already
+  // recognized before the month — total recognized credits can never exceed
+  // the fee, across any refund/cancel split over any months.
   const result = await db.query(
-    `WITH charges AS (
+    `WITH bounds AS (
+        SELECT ($1::date::timestamp AT TIME ZONE 'UTC') AS month_start,
+               (($1::date + interval '1 month')::timestamp AT TIME ZONE 'UTC') AS month_end
+     ),
+     charges AS (
         SELECT r.merchant_id,
                COALESCE(r.currency, 'UNSPECIFIED') AS currency,
                count(*)::bigint AS orders,
@@ -722,22 +870,32 @@ export async function getBillingStatement(db, { monthStartDate }) {
                -- surface the range so statements stay explainable.
                min(r.commission_rate) AS min_rate,
                max(r.commission_rate) AS max_rate
-          FROM reconciled_agent_orders r
-         WHERE r.reconciled_at >= $1::date
-           AND r.reconciled_at < ($1::date + interval '1 month')
+          FROM reconciled_agent_orders r, bounds b
+         WHERE r.reconciled_at >= b.month_start
+           AND r.reconciled_at < b.month_end
          GROUP BY r.merchant_id, COALESCE(r.currency, 'UNSPECIFIED')
      ),
      credits AS (
-        SELECT a.merchant_id,
-               COALESCE(r.currency, 'UNSPECIFIED') AS currency,
-               count(*)::bigint AS adjustments,
-               sum(a.adjusted_gmv) AS adjusted_gmv,
-               sum(a.commission_credit) AS commission_credits
-          FROM order_adjustments a
-          JOIN reconciled_agent_orders r ON r.id = a.reconciled_order_id
-         WHERE a.adjusted_at >= $1::date
-           AND a.adjusted_at < ($1::date + interval '1 month')
-         GROUP BY a.merchant_id, COALESCE(r.currency, 'UNSPECIFIED')
+        SELECT oc.merchant_id,
+               COALESCE(oc.currency, 'UNSPECIFIED') AS currency,
+               sum(oc.month_count)::bigint AS adjustments,
+               sum(oc.month_gmv) AS adjusted_gmv,
+               sum(LEAST(oc.total_credit, oc.commission_fee)
+                   - LEAST(oc.prior_credit, oc.commission_fee)) AS commission_credits
+          FROM (
+            SELECT r.id, r.merchant_id, r.currency, r.commission_fee,
+                   count(*) FILTER (WHERE a.adjusted_at >= b.month_start) AS month_count,
+                   COALESCE(sum(a.adjusted_gmv) FILTER (WHERE a.adjusted_at >= b.month_start), 0) AS month_gmv,
+                   COALESCE(sum(a.commission_credit), 0) AS total_credit,
+                   COALESCE(sum(a.commission_credit) FILTER (WHERE a.adjusted_at < b.month_start), 0) AS prior_credit
+              FROM order_adjustments a
+              JOIN reconciled_agent_orders r ON r.id = a.reconciled_order_id
+              CROSS JOIN bounds b
+             WHERE a.adjusted_at < b.month_end
+             GROUP BY r.id, r.merchant_id, r.currency, r.commission_fee, b.month_start
+            HAVING count(*) FILTER (WHERE a.adjusted_at >= b.month_start) > 0
+          ) oc
+         GROUP BY oc.merchant_id, COALESCE(oc.currency, 'UNSPECIFIED')
      )
      SELECT m.id AS merchant_id,
             m.shopify_shop_domain,
@@ -816,6 +974,10 @@ export async function getPriceBenchmark(db, { windowDays }) {
         WHERE calculated_loss_reason = 'PRICE_DISCREPANCY'
           AND created_at >= now() - make_interval(days => $1)
           AND (competitor_delta_payload->>'delta_cents') IS NOT NULL
+          -- The sentinel is not a product: a reprice worklist entry named
+          -- UNSPECIFIED is unactionable noise (traffic top-SKUs filters it
+          -- the same way).
+          AND target_sku <> 'UNSPECIFIED'
         GROUP BY target_sku
         ORDER BY sum(estimated_revenue_lost) DESC
         LIMIT 20`,

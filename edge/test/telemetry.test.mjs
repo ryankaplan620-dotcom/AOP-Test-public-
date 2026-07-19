@@ -393,3 +393,50 @@ it('event_id survives the degraded/hostile record paths', async () => {
   const record = await buildTelemetryRecord(null, 'not a url at all', undefined);
   assert.match(record.event_id, /^[0-9a-f-]{36}$/i);
 });
+
+// ---------------------------------------------------------------------------
+// Review regressions: query-string redaction + protocol street-address keys
+// ---------------------------------------------------------------------------
+
+it('redacts PII from query parameters (they bypass the body redactor)', async () => {
+  const url =
+    'https://proxy.example/shipping_quote?sku=SKU-1&email=jane%40example.com&address1=123%20Main%20St&zip=90210';
+  const record = await buildTelemetryRecord(null, url, META);
+  assert.ok(!record.query.includes('jane'), 'email value must be gone');
+  assert.ok(!record.query.includes('Main'), 'street value must be gone');
+  assert.ok(record.query.includes('sku=SKU-1'), 'non-PII params survive');
+  assert.ok(record.query.includes('zip=90210'), 'allowlisted geo survives');
+  assert.ok(record.pii_redactions >= 2, `audit counter counts query hits (${record.pii_redactions})`);
+});
+
+it('redacts ACP line_one/line_two and AP2 address_line street fields from bodies', async () => {
+  const body = JSON.stringify({
+    address: { line_one: '9 Elm Grove', line_two: 'Apt 4', zip: '10001' },
+    shipping: { address_line: ['77 Rue de Rivoli', 'Etage 2'], country: 'FR' },
+  });
+  const request = new Request('https://proxy.example/shipping_quote', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  });
+  const record = await buildTelemetryRecord(request, request.url, META);
+  const flat = JSON.stringify(record.inbound_payload);
+  assert.ok(!flat.includes('Elm Grove'), 'ACP line_one redacted');
+  assert.ok(!flat.includes('Apt 4'), 'ACP line_two redacted');
+  assert.ok(!flat.includes('Rivoli'), 'AP2 address_line redacted');
+  assert.ok(flat.includes('10001'), 'zip survives');
+  assert.ok(flat.includes('FR'), 'country survives');
+});
+
+it('geo-allowlisted keys cannot smuggle PII values', async () => {
+  const body = JSON.stringify({ state: 'call me at +1 (415) 555-0100 ok', zip: '94103' });
+  const request = new Request('https://proxy.example/shipping_quote', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  });
+  const record = await buildTelemetryRecord(request, request.url, META);
+  const flat = JSON.stringify(record.inbound_payload);
+  assert.ok(!flat.includes('555-0100'), 'phone smuggled under "state" is redacted');
+  assert.ok(flat.includes('94103'), 'plausible zip kept');
+});

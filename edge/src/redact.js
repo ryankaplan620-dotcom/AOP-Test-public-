@@ -79,6 +79,15 @@ const PII_KEYS = new Set([
   'streetaddress',
   'line1',
   'line2',
+  // Canonical street-line field names of the two supported protocols —
+  // ACP checkout sessions use line_one/line_two, AP2 (W3C PaymentRequest
+  // ContactAddress) uses address_line / addressLine (an ARRAY of lines;
+  // key-redaction replaces the whole array). normalizeKey folds the
+  // underscore variants onto these.
+  'lineone',
+  'linetwo',
+  'addressline',
+  'addresslines',
   'city',
   'company',
   'organization',
@@ -159,15 +168,39 @@ function redactValue(value, depth, counter) {
     for (const [key, entry] of Object.entries(value)) {
       const normalized = normalizeKey(key);
       if (GEO_ALLOWLIST.has(normalized)) {
-        // Coarse geo is the one thing we are allowed to keep verbatim (when
-        // it is a scalar — a nested object under "state" still gets walked).
-        out[key] =
-          typeof entry === 'object' && entry !== null
-            ? redactValue(entry, depth + 1, counter)
-            : entry;
+        // Coarse geo is the one thing we are allowed to keep — but only when
+        // the VALUE actually looks like a geo token. An allowlisted key must
+        // not become a smuggling channel ("state": "john@x.com 555-0100"):
+        // real zip/state/country values are short and pass the same
+        // value-based scrub as everything else, so anything the scrubber
+        // flags (or an implausibly long value) is redacted, not kept.
+        if (typeof entry === 'string') {
+          const { hits } = scrubString(entry);
+          if (hits > 0 || entry.length > 64) {
+            counter.hits += 1;
+            out[key] = REDACTED;
+          } else {
+            out[key] = entry;
+          }
+        } else if (typeof entry === 'object' && entry !== null) {
+          out[key] = redactValue(entry, depth + 1, counter);
+        } else {
+          out[key] = entry;
+        }
         continue;
       }
       if (PII_KEYS.has(normalized)) {
+        // "address" is a CONTAINER in ACP/AP2 payloads: its children carry
+        // both street lines (PII, redacted by their own keys) and the geo
+        // fields the memo allows (zip/state/country). Walking it preserves
+        // the allowed granularity; a blanket REDACTED would destroy it.
+        // Every other PII key (names, emails, address_line ARRAYS of street
+        // strings, ...) is redacted wholesale — walking those could leak
+        // free-text fragments the value scrubber cannot recognize.
+        if (normalized === 'address' && entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
+          out[key] = redactValue(entry, depth + 1, counter);
+          continue;
+        }
         counter.hits += 1;
         out[key] = REDACTED;
         continue;
@@ -200,6 +233,57 @@ export function redactPii(payload) {
     return { payload: redacted, redactions: counter.hits };
   } catch {
     return { payload: null, redactions: -1 };
+  }
+}
+
+/**
+ * Redact PII from a URL query string ("?a=b&c=d", as URL.search returns it).
+ *
+ * The body snapshot goes through redactPii, but agents also put PII in
+ * QUERY PARAMETERS (GET /shipping_quote?email=...&address1=...), and the
+ * query was previously recorded verbatim — a straight bypass of the
+ * compliance layer. Same two passes as the body: PII-named keys drop their
+ * value, surviving values get the string scrub. Geo-allowlisted keys keep
+ * plausible geo values (same smuggling guard as objects).
+ *
+ * @param {string|null|undefined} search  URL.search ('' when absent).
+ * @returns {{query: string, redactions: number}} re-serialized query
+ *   (leading '?' preserved when non-empty). On ANY failure returns
+ *   {query: '', redactions: -1} — dropping the query is the fail-safe.
+ */
+export function redactQueryString(search) {
+  try {
+    if (typeof search !== 'string' || search === '' || search === '?') {
+      return { query: '', redactions: 0 };
+    }
+    const params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
+    let redactions = 0;
+    const out = new URLSearchParams();
+    for (const [key, value] of params) {
+      const normalized = normalizeKey(key);
+      if (PII_KEYS.has(normalized)) {
+        redactions += 1;
+        out.append(key, REDACTED);
+        continue;
+      }
+      if (GEO_ALLOWLIST.has(normalized)) {
+        const { hits } = scrubString(value);
+        if (hits > 0 || value.length > 64) {
+          redactions += 1;
+          out.append(key, REDACTED);
+        } else {
+          out.append(key, value);
+        }
+        continue;
+      }
+      const { value: scrubbed, hits } = scrubString(value);
+      redactions += hits;
+      out.append(key, scrubbed);
+    }
+    const serialized = out.toString();
+    return { query: serialized === '' ? '' : `?${serialized}`, redactions };
+  } catch {
+    return { query: '', redactions: -1 };
   }
 }
 

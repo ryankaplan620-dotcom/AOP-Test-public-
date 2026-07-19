@@ -45,6 +45,10 @@ queue = "aop-edge-telemetry"
 max_batch_size = 100
 max_batch_timeout = 5
 max_retries = 5
+# Redelivery backoff (also set explicitly via retryAll({delaySeconds}) in the
+# consumer): without it, retries burn out in seconds during a brief ingest
+# outage and good batches dead-letter.
+retry_delay = 30
 dead_letter_queue = "aop-edge-telemetry-dlq"
 
 # -----------------------------------------------------------------------------

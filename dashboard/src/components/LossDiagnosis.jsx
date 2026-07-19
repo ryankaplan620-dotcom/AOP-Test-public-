@@ -12,7 +12,7 @@
  * — an analytics blip must never blank the merchant's numbers.
  */
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchSummary, fetchLossReasons, fetchActivity, fetchBenchmark } from '../api.js';
 import { formatMoney, formatCount, formatPct, formatClock, lossReasonLabel } from '../format.js';
 
@@ -35,31 +35,40 @@ export default function LossDiagnosis({ settings }) {
   const [reasons, setReasons] = useState(null);
   const [benchmark, setBenchmark] = useState(null);
   const [activity, setActivity] = useState(null);
-  const [error, setError] = useState(null);
+  // SEPARATE error states: the 5s activity poller and the 30s headline
+  // poller must not share one — a healthy activity poll would wipe the
+  // banner within 5s while summary/reasons are still failing.
+  const [headlineError, setHeadlineError] = useState(null);
+  const [activityError, setActivityError] = useState(null);
+  // Stale-response guard for window changes (24h -> 90d etc.).
+  const headlineSeq = useRef(0);
 
   const refreshHeadline = useCallback(async () => {
-    try {
-      const [s, r, b] = await Promise.all([
-        fetchSummary(settings, days),
-        fetchLossReasons(settings, days),
-        fetchBenchmark(settings, days),
-      ]);
-      setSummary(s);
-      setReasons(r);
-      setBenchmark(b);
-      setError(null);
-    } catch (err) {
-      setError(err.message);
-    }
+    const seq = ++headlineSeq.current;
+    // allSettled, not all: each endpoint lands independently. The benchmark
+    // panel is auxiliary — its failure must never blank the summary cards
+    // and loss-reasons table (previously a benchmark-only outage left the
+    // whole screen at 'Loading…' forever).
+    const [s, r, b] = await Promise.allSettled([
+      fetchSummary(settings, days),
+      fetchLossReasons(settings, days),
+      fetchBenchmark(settings, days),
+    ]);
+    if (seq !== headlineSeq.current) return; // superseded by a newer window
+    if (s.status === 'fulfilled') setSummary(s.value);
+    if (r.status === 'fulfilled') setReasons(r.value);
+    if (b.status === 'fulfilled') setBenchmark(b.value);
+    const firstFailure = [s, r, b].find((outcome) => outcome.status === 'rejected');
+    setHeadlineError(firstFailure ? firstFailure.reason?.message ?? 'request failed' : null);
   }, [settings, days]);
 
   const refreshActivity = useCallback(async () => {
     try {
       const a = await fetchActivity(settings, 50);
       setActivity(a);
-      setError(null);
+      setActivityError(null);
     } catch (err) {
-      setError(err.message);
+      setActivityError(err.message);
     }
   }, [settings]);
 
@@ -77,10 +86,10 @@ export default function LossDiagnosis({ settings }) {
 
   return (
     <div>
-      {error ? (
+      {headlineError || activityError ? (
         <div className="error-banner">
-          Analytics unavailable: {error} — check the Settings tab (URL + token). Showing last
-          known data.
+          Analytics unavailable: {headlineError ?? activityError} — check the Settings tab (URL +
+          token). Showing last known data.
         </div>
       ) : null}
 

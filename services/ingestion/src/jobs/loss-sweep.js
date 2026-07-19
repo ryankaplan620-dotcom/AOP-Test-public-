@@ -26,7 +26,12 @@
 
 import { classifyLoss } from '../lib/loss-classifier.js';
 import { formatCentsAsDecimal } from '../lib/commission.js';
-import { findExpiredUnreconciledIntents, insertLossDiagnostic } from '../repositories.js';
+import {
+  findExpiredUnreconciledIntents,
+  insertLossDiagnostic,
+  getSweepWatermark,
+  setSweepWatermark,
+} from '../repositories.js';
 
 /**
  * Rows fetched per sweep tick. Bounds sweep latency and memory under
@@ -34,6 +39,18 @@ import { findExpiredUnreconciledIntents, insertLossDiagnostic } from '../reposit
  * in the repository guarantees no starvation).
  */
 export const SWEEP_BATCH_SIZE = 200;
+
+/** sweep_state.job_name key for this job's watermark (migration 0012). */
+export const SWEEP_JOB_NAME = 'loss_sweep';
+
+/**
+ * Watermark overlap slack. The watermark advances to the newest FULLY
+ * processed instant; the next scan starts this far below it so batch-µs
+ * offsets, clock skew between now() evaluations, and rows committed with a
+ * slightly older processed_at (in-flight inserts at watermark time) can
+ * never be skipped past. 60s dwarfs every such effect.
+ */
+const WATERMARK_SLACK_MS = 60_000;
 
 /**
  * Start the sweep.
@@ -74,14 +91,39 @@ export function startLossSweep({ db, config, logger }) {
   /**
    * One sweep pass: fetch -> classify -> insert, with per-row isolation.
    * Never rejects: every failure path is caught and logged.
+   *
+   * Watermark protocol (sweep_state, migration 0012): without a lower bound
+   * the sweep query re-VISITS the whole retention window every tick (the
+   * anti-joins only exclude rows from the result), which outgrows
+   * statement_timeout at firehose scale. The watermark advances only after
+   * an error-free pass — to the batch's newest processed_at on a full batch,
+   * or to (now - expiry) when the frontier is drained — and the next scan
+   * starts WATERMARK_SLACK_MS below it. Rows in the overlap are cheap
+   * anti-join no-ops; rows that errored keep being retried because the
+   * watermark never moves past them.
    */
   async function sweepPass() {
     const summary = { fetched: 0, diagnosed: 0, conflicts: 0, rowErrors: 0 };
+
+    let watermark = null;
+    try {
+      const stored = await getSweepWatermark(db, SWEEP_JOB_NAME);
+      if (stored !== null) {
+        const ms = Date.parse(stored instanceof Date ? stored.toISOString() : String(stored));
+        if (Number.isFinite(ms)) watermark = new Date(ms - WATERMARK_SLACK_MS).toISOString();
+      }
+    } catch (err) {
+      // Missing table (pre-0012) or transient failure: a full scan is
+      // correct, just slower — proceed unbounded and say so.
+      logger.warn('loss sweep watermark unavailable; scanning unbounded this tick', { err });
+    }
+
     let rows;
     try {
       rows = await findExpiredUnreconciledIntents(db, {
         expirySeconds: config.intentExpirySeconds,
         limit: SWEEP_BATCH_SIZE,
+        watermark,
       });
     } catch (err) {
       // DB unavailable — nothing to do this tick; the interval retries.
@@ -126,6 +168,26 @@ export function startLossSweep({ db, config, logger }) {
           err,
           intent_log_id: row?.id ?? null,
         });
+      }
+    }
+
+    // Advance the watermark only when every fetched row resolved (diagnosed
+    // or lost an idempotent conflict) — an errored row must stay above the
+    // watermark so future ticks retry it.
+    if (summary.rowErrors === 0) {
+      try {
+        const next =
+          rows.length < SWEEP_BATCH_SIZE
+            ? // Frontier drained: everything older than the expiry cutoff is
+              // fully processed as of this pass.
+              new Date(Date.now() - config.intentExpirySeconds * 1000).toISOString()
+            : // Full batch: processed through the newest row we actually saw
+              // (rows are oldest-first, so the last one is the newest).
+              new Date(rows[rows.length - 1].processed_at).toISOString();
+        await setSweepWatermark(db, SWEEP_JOB_NAME, next);
+      } catch (err) {
+        // Non-fatal: the next tick just rescans from the old watermark.
+        logger.warn('loss sweep could not persist watermark', { err });
       }
     }
 

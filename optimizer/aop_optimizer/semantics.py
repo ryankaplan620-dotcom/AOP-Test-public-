@@ -485,6 +485,25 @@ _FREE_SHIP_COND_RES = [
         rf"\bspend\s+\$?\s*{_MONEY}\s*\+?\b[^.!?\n]{{0,40}}?\bfree\s+shipping",
         re.IGNORECASE,
     ),
+    # "free shipping when you spend $50" / "free shipping if you spend $50+"
+    re.compile(
+        rf"\bfree\s+(?:standard\s+|ground\s+|express\s+)?shipping\b"
+        rf"[^.!?\n]{{0,40}}?\b(?:when|if|once)\s+you\s+spend\s+\$?\s*{_MONEY}",
+        re.IGNORECASE,
+    ),
+    # "free shipping on orders $50+" / "free shipping on orders of $75 or more"
+    re.compile(
+        rf"\bfree\s+(?:standard\s+|ground\s+|express\s+)?shipping\b"
+        rf"[^.!?\n]{{0,40}}?\b(?:orders?|purchases?)\s+(?:of\s+)?\$?\s*{_MONEY}"
+        rf"\s*(?:\+|or\s+more|and\s+(?:up|above|over))",
+        re.IGNORECASE,
+    ),
+    # "free shipping with a minimum purchase/order of $X" / "minimum spend of $X"
+    re.compile(
+        rf"\bfree\s+(?:standard\s+|ground\s+|express\s+)?shipping\b"
+        rf"[^.!?\n]{{0,40}}?\bminimum\s+(?:purchase|order|spend)\s+(?:of\s+)?\$?\s*{_MONEY}",
+        re.IGNORECASE,
+    ),
 ]
 
 # Any free-shipping mention at all: "free shipping", "free standard shipping".
@@ -551,6 +570,17 @@ def _extract_free_shipping(text: str, metrics: PolicyMetrics) -> None:
 #   "$10 restocking fee"               -> amt_b=10
 #   "restocking fee of $7.50"          -> amt_a=7.50
 #   "a restocking fee applies"         -> no magnitude captured
+# Negation-aware: "no/zero restocking fees", "without a restocking fee",
+# "never charge restocking fees" are PROMISES, not penalties — the exact
+# phrasing our own REMOVE_RESTOCKING_FEE directive tells merchants to
+# publish, which previously re-triggered this probe and made the projected
+# score gain unachievable.
+_RESTOCK_NEGATION_RE = re.compile(
+    r"\b(?:no|zero|without\s+(?:a|any)?|never\s+charge(?:s|d)?(?:\s+a|\s+any)?|not?\s+subject\s+to\s+(?:a|any)?)"
+    r"\s*(?:hidden\s+)?restock(?:ing)?\s+fees?",
+    re.IGNORECASE,
+)
+
 _RESTOCK_RE = re.compile(
     r"(?:(?P<pct_b>\d{1,3}(?:\.\d+)?)\s*(?:%|percent)\s*"
     r"|\$\s*(?P<amt_b>\d{1,6}(?:\.\d{1,2})?)\s*)?"
@@ -568,7 +598,10 @@ _STORE_CREDIT_RE = re.compile(
     r"|\bonly\s+(?:issue|offer|provide|receive)?\s*store[\s-]*credit\b"
     r"|\brefund(?:s|ed)?\s+(?:will\s+be\s+|are\s+)?(?:issued\s+|given\s+|provided\s+)?"
     r"(?:as|in|to|via)\s+store[\s-]*credit\b"
-    r"|\b(?:for|as|in)\s+store[\s-]*credit(?:\s+only)?\b)",
+    # NOTE: no bare "(for|as|in) store credit" branch — "you may opt for
+    # store credit" merely OFFERS credit as an option and must not be
+    # penalized as credit-ONLY; exclusivity requires "only" adjacency.
+    r"|\b(?:for|as|in)\s+store[\s-]*credit\s+only\b)",
     re.IGNORECASE,
 )
 
@@ -648,7 +681,9 @@ def _extract_hidden_penalties(text: str, metrics: PolicyMetrics) -> None:
     """
     found: List[HiddenPenaltyTerm] = []
 
-    restock = _RESTOCK_RE.search(text)
+    # Remove negated ("no restocking fees") mentions first — a merchant
+    # PROMISING the absence of a fee must never be penalized for the fee.
+    restock = _RESTOCK_RE.search(_RESTOCK_NEGATION_RE.sub(" ", text))
     if restock is not None:
         percent = _to_float(restock.group("pct_b")) or _to_float(restock.group("pct_a"))
         amount = _to_float(restock.group("amt_b")) or _to_float(restock.group("amt_a"))

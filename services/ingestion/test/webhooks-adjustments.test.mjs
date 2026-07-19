@@ -180,17 +180,23 @@ test('webhook redelivery is acknowledged as already_credited (UNIQUE backstop)',
   }
 });
 
-test('refund of a never-attributed (human) order credits nothing', async () => {
+test('refund arriving before its order webhook parks the credit for replay', async () => {
   const db = fakeDb([
     merchantHit,
     [/FROM reconciled_agent_orders[\s\S]*FOR UPDATE/, { rows: [], rowCount: 0 }],
+    [/INSERT INTO order_adjustment_orphans/, { rows: [], rowCount: 1 }],
   ]);
   const app = await startApp(db);
   try {
     const { status, body } = await postWebhook(app.url, '/webhooks/shopify/refunds-create', REFUND);
     assert.equal(status, 200);
-    assert.equal(body.action, 'order_not_attributed');
-    assert.ok(!db.statements.some((s) => /INSERT INTO order_adjustments/.test(s.text)));
+    assert.equal(body.action, 'credit_parked');
+    // The credit must NOT hit the live ledger (no reconciled order to clamp
+    // against) — it goes to the parking lot with the same idempotency key.
+    assert.ok(!db.statements.some((s) => /INSERT INTO order_adjustments\b/.test(s.text) && !/orphans/.test(s.text)));
+    const park = db.statements.find((s) => /INSERT INTO order_adjustment_orphans/.test(s.text));
+    assert.ok(park, 'must park the credit');
+    assert.equal(park.params[2], 'refund:998877');
   } finally {
     await app.close();
   }

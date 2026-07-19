@@ -192,16 +192,11 @@ export function loadConfig(env = process.env) {
     }
   }
 
-  if (problems.length > 0) {
-    throw new ConfigError(
-      'AOP ingestion service refused to start — configuration problems:\n' +
-        problems.map((p) => `  - ${p}`).join('\n')
-    );
-  }
-
   // Proxy-hostname suffix for OAuth-derived routing (e.g. '.agents.example
   // .com'): install derives proxy_hostname = <shop handle> + suffix. OPTIONAL:
   // unset leaves proxy_hostname NULL (operator assigns routing manually).
+  // Validated BEFORE the single throw below — the fail-fast contract promises
+  // EVERY problem in one message, so no validation may run after a throw.
   let proxyHostnameSuffix = null;
   const suffixRaw = env.PROXY_HOSTNAME_SUFFIX;
   if (suffixRaw !== undefined && suffixRaw !== null && String(suffixRaw).trim() !== '') {

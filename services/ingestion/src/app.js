@@ -52,10 +52,14 @@ export function buildApp({ config, db, logger }) {
   // ---- 1. RAW-body webhook route (BEFORE any JSON parsing — see header) --
   app.use('/webhooks', buildWebhooksRouter({ config, db, logger: logger.child('webhooks') }));
 
-  // ---- 2. JSON parsing for everything else -------------------------------
-  // 2mb limit: a full 500-record telemetry batch with 32KB-capped payloads
-  // stays well under this only in the aggregate-typical case; genuinely
-  // oversized batches surface as 413 via the central error handler.
+  // ---- 2. JSON parsing --------------------------------------------------
+  // The ingest route gets its own 24mb bound BEFORE the general parser: the
+  // wire-format worst case is real — 500 records/batch x 32KB edge-capped
+  // payloads x ~1.4 JSON-escaping expansion — and a 413 here is not a
+  // client error but DATA LOSS (the queue consumer retries the same
+  // too-big batch until it dead-letters). Everything else keeps a tight
+  // 2mb: no other route legitimately carries big bodies.
+  app.use('/ingest', express.json({ limit: '24mb' }));
   app.use(express.json({ limit: '2mb' }));
 
   // ---- 3. Worker Ingestion Engine ---------------------------------------
@@ -79,12 +83,26 @@ export function buildApp({ config, db, logger }) {
   // balancers treat 503 as "back off, retry later" — which is exactly right
   // while the DB reconnects. The merchant's live storefront traffic does not
   // pass through this service, so a degraded healthz never gates commerce.
+  //
+  // Probe result is memoized for 5s: /healthz is rate-limit-exempt (LB
+  // probes must never 429), so without the memo it would be an
+  // unauthenticated, unmetered SELECT-1 amplifier against the same pool the
+  // ingest hot path uses. 5s staleness is irrelevant to LB semantics.
+  const HEALTH_CACHE_MS = 5_000;
+  let healthCache = { at: 0, ok: false };
   app.get('/healthz', async (_req, res) => {
-    try {
-      await db.query('SELECT 1');
+    if (Date.now() - healthCache.at >= HEALTH_CACHE_MS) {
+      try {
+        await db.query('SELECT 1');
+        healthCache = { at: Date.now(), ok: true };
+      } catch (err) {
+        logger.error('healthz database ping failed', { err });
+        healthCache = { at: Date.now(), ok: false };
+      }
+    }
+    if (healthCache.ok) {
       res.status(200).json({ status: 'ok' });
-    } catch (err) {
-      logger.error('healthz database ping failed', { err });
+    } else {
       res.status(503).json({ status: 'degraded', reason: 'database unreachable' });
     }
   });

@@ -42,6 +42,10 @@ import {
   findLatestIntentByToken,
   insertReconciledOrder,
   insertOrderAdjustment,
+  insertAdjustmentOrphan,
+  findAdjustmentOrphansForOrder,
+  deleteAdjustmentOrphan,
+  deleteLossDiagnosticForIntent,
 } from '../repositories.js';
 
 /** The note_attributes/attributes key agents echo the edge token under. */
@@ -180,19 +184,29 @@ async function gateShopifyWebhook(req, res, { config, db, logger }) {
 }
 
 /**
- * Total refunded amount of a refunds/create payload, in integer cents.
+ * Total refunded amount of a refunds/create payload: integer cents plus the
+ * currency the amount is denominated in (null when the payload names none).
  *
  * Primary source: refund.transactions — the money actually moved back to the
  * buyer (kind 'refund'; status defaults to success when absent, and 'failure'
  * / 'error' rows are excluded so a failed refund attempt never credits).
- * Fallback: refund_line_items[].subtotal (older payloads / restock-only
- * shapes). Returns null when no parseable amount exists, 0 for an explicit
- * zero-money refund (restock without payment movement).
+ * The transaction currency is captured so the ledger can REFUSE to net a
+ * presentment-currency amount against shop-currency GMV (currency_mismatch)
+ * instead of silently mixing currencies.
+ *
+ * Fallback when no transactions exist: refund_line_items subtotal PLUS
+ * total_tax (the charged GMV is tax-inclusive — crediting tax-exclusive
+ * subtotals would systematically under-credit) plus any order_adjustments
+ * (shipping refunds arrive there, not as line items).
+ *
+ * Returns {cents, currency} — cents null when no parseable amount exists,
+ * 0 for an explicit zero-money refund (restock without payment movement).
  */
-function refundedCents(refund) {
+function refundedAmount(refund) {
   const transactions = Array.isArray(refund?.transactions) ? refund.transactions : [];
   let total = 0;
   let sawTransaction = false;
+  let currency = null;
   for (const tx of transactions.slice(0, 100)) {
     if (tx === null || typeof tx !== 'object') continue;
     if (tx.kind !== 'refund') continue;
@@ -202,20 +216,41 @@ function refundedCents(refund) {
     if (cents === null) continue;
     sawTransaction = true;
     total += cents;
+    if (currency === null) currency = parseCurrency(tx.currency);
   }
-  if (sawTransaction) return total;
+  if (sawTransaction) return { cents: total, currency };
 
-  const lineItems = Array.isArray(refund?.refund_line_items) ? refund.refund_line_items : [];
   let lineTotal = 0;
-  let sawLine = false;
+  let sawAmount = false;
+  const lineItems = Array.isArray(refund?.refund_line_items) ? refund.refund_line_items : [];
   for (const line of lineItems.slice(0, 250)) {
     if (line === null || typeof line !== 'object') continue;
-    const cents = parseMoneyToCents(line.subtotal);
-    if (cents === null) continue;
-    sawLine = true;
-    lineTotal += cents;
+    const subtotal = parseMoneyToCents(line.subtotal);
+    if (subtotal === null) continue;
+    sawAmount = true;
+    lineTotal += subtotal;
+    // Charged GMV (order.total_price) includes tax; the credit must too.
+    const tax = parseMoneyToCents(line.total_tax);
+    if (tax !== null) lineTotal += tax;
   }
-  return sawLine ? lineTotal : null;
+  // Shipping refunds live in order_adjustments (amounts are negative in
+  // Shopify's convention; take magnitudes).
+  const magnitudeCents = (value) => {
+    if (typeof value === 'number') return parseMoneyToCents(Math.abs(value));
+    if (typeof value === 'string') return parseMoneyToCents(value.replace(/^\s*-/, ''));
+    return null;
+  };
+  const adjustments = Array.isArray(refund?.order_adjustments) ? refund.order_adjustments : [];
+  for (const adj of adjustments.slice(0, 100)) {
+    if (adj === null || typeof adj !== 'object') continue;
+    const amount = magnitudeCents(adj.amount);
+    if (amount === null) continue;
+    sawAmount = true;
+    lineTotal += amount;
+    const tax = magnitudeCents(adj.tax_amount);
+    if (tax !== null) lineTotal += tax;
+  }
+  return { cents: sawAmount ? lineTotal : null, currency: null };
 }
 
 /**
@@ -330,6 +365,44 @@ export function buildWebhooksRouter({ config, db, logger }) {
           return;
         }
 
+        // Reverse a false LOST verdict: an intent that converted AFTER the
+        // expiry window was already swept into loss_diagnostics — leaving it
+        // double-counts the session as both LOST and WON in every aggregate.
+        if (intent !== null) {
+          const { deleted } = await deleteLossDiagnosticForIntent(db, intent.id);
+          if (deleted > 0) {
+            logger.info('late conversion: reversed prior loss diagnostic', {
+              shopify_order_id: shopifyOrderId,
+              intent_log_id: intent.id,
+            });
+          }
+        }
+
+        // Replay credits that arrived BEFORE this order webhook (Shopify
+        // does not order deliveries across topics): each parked orphan runs
+        // through the normal ledger insert — same clamp, same idempotency —
+        // then leaves the parking lot.
+        const orphans = await findAdjustmentOrphansForOrder(db, {
+          merchantId: merchant.id,
+          shopifyOrderId,
+        });
+        for (const orphan of orphans) {
+          const { status } = await insertOrderAdjustment(db, {
+            merchantId: merchant.id,
+            shopifyOrderId,
+            sourceEventId: orphan.source_event_id,
+            kind: orphan.adjustment_kind,
+            requestedGmv: orphan.requested_gmv,
+            requestedCurrency: orphan.requested_currency ?? null,
+          });
+          await deleteAdjustmentOrphan(db, orphan.id);
+          logger.info('replayed parked credit after late order reconciliation', {
+            shopify_order_id: shopifyOrderId,
+            source_event_id: orphan.source_event_id,
+            outcome: status,
+          });
+        }
+
         logger.info('order reconciled to agent intent', {
           shop_domain: shopDomain,
           shopify_order_id: shopifyOrderId,
@@ -370,11 +443,36 @@ export function buildWebhooksRouter({ config, db, logger }) {
       res.status(200).json({ ok: true, action: 'already_credited' });
       return;
     }
+    if (status === 'currency_mismatch') {
+      // Presentment-currency refund against shop-currency GMV: netting the
+      // two would be silent wrong math. Refuse loudly; operator reconciles.
+      logger.error('adjustment refused: refund currency differs from order currency', log);
+      res.status(200).json({ ok: true, action: 'refused_currency_mismatch' });
+      return;
+    }
     if (status === 'order_not_found') {
-      // Refund/cancel of an order that was never agent-attributed: nothing
-      // was billed, nothing to credit. Business-as-usual, not an error.
-      logger.info('adjustment for non-attributed order; no commission to credit', log);
-      res.status(200).json({ ok: true, action: 'order_not_attributed' });
+      // Two very different causes share this shape: the order was never
+      // agent-attributed (most orders — nothing billed, nothing to credit),
+      // OR its orders/create webhook simply hasn't arrived yet (Shopify
+      // does not order deliveries across topics). Park the credit; the
+      // reconciliation path replays it if the order ever lands. Orphans for
+      // never-attributed orders just sit harmlessly (cascade-cleaned with
+      // the merchant).
+      const { inserted } = await insertAdjustmentOrphan(db, {
+        merchantId: adjustment.merchantId,
+        shopifyOrderId: adjustment.shopifyOrderId,
+        sourceEventId: adjustment.sourceEventId,
+        kind: adjustment.kind,
+        requestedGmv: adjustment.requestedGmv,
+        requestedCurrency: adjustment.requestedCurrency ?? null,
+      });
+      logger.info(
+        inserted
+          ? 'credit parked: order not reconciled (yet); will replay if it lands'
+          : 'credit already parked (webhook redelivery)',
+        log
+      );
+      res.status(200).json({ ok: true, action: inserted ? 'credit_parked' : 'already_parked' });
       return;
     }
     // nothing_remaining: the order is already fully credited (e.g. cancelled
@@ -404,7 +502,7 @@ export function buildWebhooksRouter({ config, db, logger }) {
           return;
         }
 
-        const cents = refundedCents(refund);
+        const { cents, currency } = refundedAmount(refund);
         if (cents === null) {
           logger.error('shopify refund carries no parseable amount; NOT credited', {
             shop_domain: shopDomain,
@@ -428,6 +526,7 @@ export function buildWebhooksRouter({ config, db, logger }) {
             sourceEventId: `refund:${refundId}`,
             kind: 'REFUND',
             requestedGmv: formatCentsAsDecimal(cents) ?? '0.00',
+            requestedCurrency: currency,
           }
         );
       } catch (err) {
@@ -468,6 +567,7 @@ export function buildWebhooksRouter({ config, db, logger }) {
             sourceEventId: `cancel:${shopifyOrderId}`,
             kind: 'CANCELLATION',
             requestedGmv: null,
+            requestedCurrency: parseCurrency(order.currency),
           }
         );
       } catch (err) {

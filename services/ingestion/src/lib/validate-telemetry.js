@@ -69,6 +69,30 @@ function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * Strip U+0000 from every string in a JSON tree (keys and values).
+ *
+ * PostgreSQL's jsonb rejects the \\u0000 escape outright (22P05), and one
+ * such value in one record would abort the whole multi-row batch INSERT — a
+ * single hostile agent payload poisoning up to 499 innocent records,
+ * retried by the queue consumer until the batch dead-letters. NUL carries
+ * no analytic meaning; removal (not rejection) keeps the record while
+ * making it storable. Depth-bounded and cycle-safe by construction
+ * (JSON.parse output only).
+ */
+function stripNulCharacters(value, depth = 0) {
+  if (typeof value === 'string') {
+    return value.includes('\u0000') ? value.split('\u0000').join('') : value;
+  }
+  if (value === null || typeof value !== 'object' || depth > 32) return value;
+  if (Array.isArray(value)) return value.map((entry) => stripNulCharacters(entry, depth + 1));
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) {
+    out[stripNulCharacters(key, depth + 1)] = stripNulCharacters(entry, depth + 1);
+  }
+  return out;
+}
+
 /** Trimmed string or null. */
 function asTrimmedString(value) {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
@@ -146,6 +170,11 @@ export function validateTelemetryRecord(record) {
     if (!isPlainObject(record)) {
       return { ok: false, error: 'record must be a JSON object' };
     }
+
+    // NUL scrub FIRST: PostgreSQL rejects U+0000 in both text columns and
+    // jsonb, and one poisoned string would abort the entire multi-row batch
+    // INSERT downstream. Every later check operates on the scrubbed tree.
+    record = stripNulCharacters(record);
 
     // --- event id (ingest idempotency key, db migration 0009) -----------
     // Optional: pre-0009 edge builds don't send one, and a malformed value
