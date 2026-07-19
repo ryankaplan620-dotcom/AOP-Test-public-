@@ -131,6 +131,14 @@ export function rewritePolicy(settings, policyText) {
   });
 }
 
+/** Structured Claim Injector: audit a product record + inject JSON-LD. */
+export function auditClaims(settings, product) {
+  return request(`${baseOf(settings.optimizerUrl)}/claims`, {
+    method: 'POST',
+    body: { product },
+  });
+}
+
 /** What-if pass: baseline + counterfactual scenarios with score/prob deltas. */
 export function simulatePolicy(settings, policyText) {
   return request(`${baseOf(settings.optimizerUrl)}/simulate`, {

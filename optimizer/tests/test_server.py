@@ -125,5 +125,22 @@ class ServerTestCase(unittest.TestCase):
         self.assertIn("policy_text", payload["error"])
 
 
+    # ------------------------------------------------------ claim injector
+    def test_claims_audits_and_injects(self):
+        status, payload, _ = self._post(
+            "/claims",
+            {"product": {"title": "Tee", "sku": "T1", "description": "GOTS certified, made in Portugal, 30 cm by 40 cm, 0.2 kg, 1-year warranty", "gtin": "0012345678905", "material": "cotton"}},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["claims_score"], 100)
+        self.assertEqual(payload["product_jsonld"]["@type"], "Product")
+        self.assertEqual(payload["injection_directives"], [])
+
+    def test_claims_requires_a_product_object(self):
+        status, payload, _ = self._post("/claims", {"product": "not-an-object"})
+        self.assertEqual(status, 400)
+        self.assertIn("product", payload["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

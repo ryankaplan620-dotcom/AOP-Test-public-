@@ -14,6 +14,11 @@ admin panel") exposes exactly two POST endpoints:
     POST /rewrite  same request body
                    -> directive payload + "policy_jsonld" (current/optimized
                       schema.org blocks + rewritten_policy_text)
+    POST /claims   {"product": {...}}
+                   -> the Structured Claim Injector: audit of agent-favored
+                      claims (dimensions, certifications, durability, GTIN,
+                      ...), a schema.org Product JSON-LD with every present
+                      claim injected, and directives for the gaps
     POST /simulate same request body
                    -> the Pricing & Policy What-If Simulator: baseline score
                       plus counterfactual scenarios (extend returns, faster
@@ -48,6 +53,7 @@ from .jsonld import build_policy_jsonld
 from .scoring import AgentOptimizationEngine
 from .semantics import parse_policy_semantics
 from .simulator import simulate_variations
+from .claims import build_claims_payload
 
 #: Hard cap on accepted request bodies. Policy text is a few KB; anything
 #: beyond this is a mistake or abuse, not a policy.
@@ -161,12 +167,30 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in ("/score", "/rewrite", "/simulate"):
+        if self.path not in ("/score", "/rewrite", "/simulate", "/claims"):
             self._send_json(404, {"error": "not found"})
             return
         body = self._read_body()
         if body is None:
             return
+
+        if self.path == "/claims":
+            # Claims take a product record, not policy text — separate parse.
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"error": "request body must be valid JSON"})
+                return
+            product = data.get("product") if isinstance(data, dict) else None
+            if not isinstance(product, dict):
+                self._send_json(400, {"error": "product (JSON object) is required"})
+                return
+            try:
+                self._send_json(200, build_claims_payload(product))
+            except Exception as exc:  # pragma: no cover — payload builder is non-raising
+                self._send_json(500, {"error": f"internal error: {exc}"})
+            return
+
         params, error = _parse_request(body)
         if error is not None:
             self._send_json(400, {"error": error})
