@@ -66,6 +66,14 @@ DEFAULT_ORIGIN = ""
 # consumer POSTs batches to INGEST_API_URL + "/ingest/telemetry".
 INGEST_API_URL = "https://ingest.aop.network"
 
+# PROXY_HOSTNAME_SUFFIX: when set, hostnames NOT ending in this suffix are
+# never looked up dynamically (scanner-spray bound). Hostnames that miss the
+# static MERCHANT_ROUTES table are resolved via the ingestion service's
+# GET /routes/resolve (merchant_profiles.proxy_hostname -> origin_url,
+# populated by OAuth install) and cached per isolate — merchants onboard with
+# no worker redeploy.
+PROXY_HOSTNAME_SUFFIX = ""
+
 # INGEST_API_TOKEN is a SECRET — never put it in [vars]. Provision it with:
 #   wrangler secret put INGEST_API_TOKEN
 # The queue consumer sends it as "Authorization: Bearer <token>" on ingest POSTs.

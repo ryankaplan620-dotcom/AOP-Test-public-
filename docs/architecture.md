@@ -48,6 +48,20 @@ built by assigning `pathname`/`search` onto the configured origin — never by
 resolving the inbound path against it — so a hostile `//host` path can't turn the
 worker into an open proxy.
 
+### Dynamic merchant routing (onboarding -> edge, no redeploy)
+
+The worker resolves a proxy hostname to a merchant origin from
+`env.MERCHANT_ROUTES` (static config) first; on a miss it falls back to
+`GET /routes/resolve` on the ingestion service, which reads
+`merchant_profiles.proxy_hostname -> origin_url` — the columns the OAuth
+callback populates at install (migration 0007). So installing a merchant
+makes them routable immediately, with no `wrangler deploy`. The lookup runs
+only on a per-isolate cache miss (60s positive / 30s negative TTL, in-flight
+deduped), keeping steady-state traffic on the synchronous <5ms path; the
+`PROXY_HOSTNAME_SUFFIX` gate bounds lookups to the platform's own namespace
+so scanner spray never reaches the control plane; and the resolve call
+carries the same `INGEST_API_TOKEN` the edge already holds.
+
 ### The Queue Broker (Cloudflare Queues)
 
 High-throughput buffer between the edge and the database, protecting PostgreSQL
@@ -62,6 +76,11 @@ retries, DLQ) with zero extra infrastructure.
   (`lib/validate-telemetry.js` repairs what is safe, rejects what would corrupt
   attribution), shop-domain → merchant resolution through a 60s TTL cache, one
   multi-row parameterized INSERT per batch.
+- **Benchmark Engine** (`GET /analytics/benchmark`): aggregates the exact
+  integer-cents price evidence the loss classifier stores on
+  PRICE_DISCREPANCY diagnostics into the spec's headline insight — average
+  undercut when agents chose a competitor on price, plus a per-SKU reprice
+  worklist ranked by revenue impact.
 - **Context Reconstruction** (`lib/intent-classifier.js`): each stored intent
   is classified into a prompt-category taxonomy (GIFT_URGENT, PRICE_SENSITIVE,
   ECO_CONSCIOUS, REPLENISHMENT, ...) from explicit agent tags or free-text

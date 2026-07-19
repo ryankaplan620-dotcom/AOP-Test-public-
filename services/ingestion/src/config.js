@@ -189,6 +189,29 @@ export function loadConfig(env = process.env) {
     );
   }
 
+  // Proxy-hostname suffix for OAuth-derived routing (e.g. '.agents.example
+  // .com'): install derives proxy_hostname = <shop handle> + suffix. OPTIONAL:
+  // unset leaves proxy_hostname NULL (operator assigns routing manually).
+  let proxyHostnameSuffix = null;
+  const suffixRaw = env.PROXY_HOSTNAME_SUFFIX;
+  if (suffixRaw !== undefined && suffixRaw !== null && String(suffixRaw).trim() !== '') {
+    const suffix = String(suffixRaw).trim().toLowerCase();
+    if (/^\.[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(suffix)) {
+      proxyHostnameSuffix = suffix;
+    } else {
+      problems.push(
+        `PROXY_HOSTNAME_SUFFIX="${suffixRaw}" is invalid — expected a dot-prefixed domain suffix like ".agents.example.com"`
+      );
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new ConfigError(
+      'AOP ingestion service refused to start — configuration problems:\n' +
+        problems.map((p) => `  - ${p}`).join('\n')
+    );
+  }
+
   return {
     databaseUrl: String(env.DATABASE_URL).trim(),
     ingestApiToken: String(env.INGEST_API_TOKEN).trim(),
@@ -203,5 +226,7 @@ export function loadConfig(env = process.env) {
     // null when the onboarding feature group is not configured; the /auth
     // router answers 503 in that case.
     shopifyOauth,
+    // null when unset: OAuth installs leave proxy_hostname NULL.
+    proxyHostnameSuffix,
   };
 }

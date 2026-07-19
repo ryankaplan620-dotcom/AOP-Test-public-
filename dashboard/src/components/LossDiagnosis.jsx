@@ -13,7 +13,7 @@
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
-import { fetchSummary, fetchLossReasons, fetchActivity } from '../api.js';
+import { fetchSummary, fetchLossReasons, fetchActivity, fetchBenchmark } from '../api.js';
 import { formatMoney, formatCount, formatPct, formatClock, lossReasonLabel } from '../format.js';
 
 const SUMMARY_POLL_MS = 30_000;
@@ -33,17 +33,20 @@ export default function LossDiagnosis({ settings }) {
   const [days, setDays] = useState(7);
   const [summary, setSummary] = useState(null);
   const [reasons, setReasons] = useState(null);
+  const [benchmark, setBenchmark] = useState(null);
   const [activity, setActivity] = useState(null);
   const [error, setError] = useState(null);
 
   const refreshHeadline = useCallback(async () => {
     try {
-      const [s, r] = await Promise.all([
+      const [s, r, b] = await Promise.all([
         fetchSummary(settings, days),
         fetchLossReasons(settings, days),
+        fetchBenchmark(settings, days),
       ]);
       setSummary(s);
       setReasons(r);
+      setBenchmark(b);
       setError(null);
     } catch (err) {
       setError(err.message);
@@ -162,6 +165,45 @@ export default function LossDiagnosis({ settings }) {
           <p className="sub">{reasons ? 'No losses recorded in this window.' : 'Loading…'}</p>
         )}
       </div>
+
+      {benchmark && benchmark.price_losses > 0 ? (
+        <div className="panel">
+          <h2>Competitive Price Benchmark</h2>
+          <p className="sub">
+            When agents chose a competitor on price, you were undercut by an average of{' '}
+            <strong>{formatMoney(benchmark.avg_undercut)}</strong> (your avg{' '}
+            {formatMoney(benchmark.avg_our_price)} vs. their {formatMoney(benchmark.avg_competitor_price)}) —{' '}
+            {formatMoney(benchmark.revenue_lost)} of walked-away baskets across{' '}
+            {formatCount(benchmark.price_losses)} losses. Reprice worklist, biggest impact first:
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>SKU</th>
+                <th className="num">Price Losses</th>
+                <th className="num">Your Avg Price</th>
+                <th className="num">Competitor Avg</th>
+                <th className="num">Avg Undercut</th>
+                <th className="num">Revenue Lost</th>
+              </tr>
+            </thead>
+            <tbody>
+              {benchmark.by_sku.map((row) => (
+                <tr key={row.sku}>
+                  <td>{row.sku}</td>
+                  <td className="num">{formatCount(row.losses)}</td>
+                  <td className="num">{formatMoney(row.avg_our_price)}</td>
+                  <td className="num">{formatMoney(row.avg_competitor_price)}</td>
+                  <td className="num" style={{ color: 'var(--lost)' }}>
+                    -{formatMoney(row.avg_undercut)}
+                  </td>
+                  <td className="num">{formatMoney(row.revenue_lost)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
 
       <div className="panel">
         <h2>Recent Loss Logs (Live Stream)</h2>

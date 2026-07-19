@@ -138,3 +138,27 @@ export function buildAuthorizeUrl({ shop, apiKey, appUrl, state }) {
   url.searchParams.set('state', state);
   return url.toString();
 }
+
+/**
+ * Derive the merchant's AOP proxy hostname at install time:
+ * `<shop handle><suffix>` — e.g. redthread.myshopify.com + '.agents.example
+ * .com' -> redthread.agents.example.com. Pure; null when no suffix is
+ * configured (routing then stays operator-assigned) or inputs are invalid.
+ *
+ * @param {string} shopDomain normalizeShopDomain()-validated *.myshopify.com.
+ * @param {string|null} suffix config.proxyHostnameSuffix ('.agents.x.com').
+ * @returns {string|null}
+ */
+export function deriveProxyHostname(shopDomain, suffix) {
+  try {
+    const shop = normalizeShopDomain(shopDomain);
+    if (shop === null) return null;
+    if (typeof suffix !== 'string' || !suffix.startsWith('.') || suffix.length < 3) return null;
+    const handle = shop.slice(0, -'.myshopify.com'.length);
+    const hostname = `${handle}${suffix.toLowerCase()}`;
+    // Fits the DB column and stays a plausible hostname.
+    return hostname.length <= 255 ? hostname : null;
+  } catch {
+    return null;
+  }
+}

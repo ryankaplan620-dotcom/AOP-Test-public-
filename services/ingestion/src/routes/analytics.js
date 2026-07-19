@@ -12,6 +12,7 @@
  *   /analytics/activity?limit=50    interleaved WON/LOST live stream
  *   /analytics/traffic?days=7       protocol share, prompt categories, top SKUs
  *   /analytics/billing?month=YYYY-MM monthly commission statement per merchant
+ *   /analytics/benchmark?days=7     price-competitiveness benchmark (Benchmark Engine)
  *
  * Security model:
  *   - Read-only aggregates; no per-consumer PII exists downstream anyway
@@ -36,6 +37,7 @@ import {
   getRecentActivity,
   getTrafficBreakdown,
   getBillingStatement,
+  getPriceBenchmark,
 } from '../repositories.js';
 
 /**
@@ -177,6 +179,34 @@ export function buildAnalyticsRouter({ config, db, logger }) {
           gmv: decimal(totals.gmv_cents),
           commission: decimal(totals.commission_cents),
         },
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- GET /analytics/benchmark --------------------------------------------
+  router.get('/benchmark', async (req, res, next) => {
+    try {
+      const windowDays = parseWindowDays(req.query.days);
+      const benchmark = await getPriceBenchmark(db, { windowDays });
+      // Cents -> decimal strings at the edge of the API (money never floats).
+      const money = (c) => (c === null ? null : `${Math.floor(c / 100)}.${String(Math.round(c) % 100).padStart(2, '0')}`);
+      res.json({
+        window_days: windowDays,
+        price_losses: benchmark.price_losses,
+        revenue_lost: benchmark.revenue_lost,
+        avg_undercut: money(benchmark.avg_delta_cents),
+        avg_our_price: money(benchmark.avg_our_price_cents),
+        avg_competitor_price: money(benchmark.avg_competitor_price_cents),
+        by_sku: benchmark.by_sku.map((row) => ({
+          sku: row.sku,
+          losses: row.losses,
+          avg_undercut: money(row.avg_delta_cents),
+          avg_our_price: money(row.avg_our_price_cents),
+          avg_competitor_price: money(row.avg_competitor_price_cents),
+          revenue_lost: row.revenue_lost,
+        })),
       });
     } catch (err) {
       next(err);

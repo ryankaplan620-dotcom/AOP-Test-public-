@@ -132,13 +132,15 @@ cd db && node --check migrate.mjs            # runner syntax; SQL verified again
 | `RETENTION_SWEEP_INTERVAL_MS` | ingestion | Retention purge cadence (default `21600000` = 6h) |
 | `MERCHANT_ROUTES` | edge (`[vars]`) | JSON map: proxy hostname → merchant origin base URL |
 | `DEFAULT_ORIGIN` | edge (`[vars]`) | Fallback origin; empty = 502 unknown hostnames |
-| `INGEST_API_URL` | edge (`[vars]`) | Base URL of the ingestion service |
+| `INGEST_API_URL` | edge (`[vars]`) | Base URL of the ingestion service (also the dynamic-routing resolve host) |
+| `PROXY_HOSTNAME_SUFFIX` | edge (`[vars]`) + ingestion | Proxy-hostname suffix for OAuth-derived dynamic routing; bounds edge dynamic lookups |
 | `DASHBOARD_API_TOKEN` | ingestion | Bearer token gating the read-only `/analytics/*` routes (unset = analytics disabled) |
 | `DASHBOARD_ALLOWED_ORIGIN` | ingestion | CORS origin reflected on `/analytics/*` (default `*`; pin in production) |
 | `AOP_OPTIMIZER_HOST` / `AOP_OPTIMIZER_PORT` | optimizer server | Bind address of the scoring microservice (default `127.0.0.1:8899`) |
 | `SHOPIFY_API_KEY` / `SHOPIFY_API_SECRET` | ingestion | Shopify app credentials for the OAuth install flow (`/auth/install`) |
 | `TOKEN_ENCRYPTION_KEY` | ingestion | 64-hex AES-256-GCM key for merchant tokens at rest (`openssl rand -hex 32`) |
 | `APP_URL` | ingestion | Public base URL of the service (OAuth redirect + registered webhook address) |
+| `PROXY_HOSTNAME_SUFFIX` | ingestion | Derives `merchant_profiles.proxy_hostname` at install (`<handle>` + suffix) |
 
 ## Compliance posture
 
