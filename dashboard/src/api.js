@@ -97,6 +97,12 @@ export function fetchLossReasons(settings, days) {
   });
 }
 
+export function fetchTraffic(settings, days) {
+  return request(`${baseOf(settings.analyticsUrl)}/analytics/traffic?days=${days}`, {
+    token: settings.dashboardToken,
+  });
+}
+
 export function fetchActivity(settings, limit) {
   return request(`${baseOf(settings.analyticsUrl)}/analytics/activity?limit=${limit}`, {
     token: settings.dashboardToken,
