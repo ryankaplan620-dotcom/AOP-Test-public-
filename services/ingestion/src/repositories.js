@@ -514,3 +514,67 @@ export async function getBillingStatement(db, { monthStartDate }) {
     max_rate: String(row.max_rate),
   }));
 }
+
+/**
+ * Competitive price benchmark (routes/analytics.js — the Benchmark Engine).
+ *
+ * Source: loss_diagnostics rows with reason PRICE_DISCREPANCY, whose
+ * competitor_delta_payload was written by the loss classifier with exact
+ * integer-cents evidence ({our_price_cents, competitor_price_cents,
+ * delta_cents}). Aggregating that evidence answers the spec's headline
+ * question — "how much higher was my price when an agent chose a
+ * competitor?" — overall and per SKU (the reprice worklist).
+ *
+ * Cents arrive as JSONB numbers; aggregates coerce via (->>...)::bigint and
+ * guard with IS NOT NULL so legacy/foreign rows without evidence are simply
+ * excluded rather than poisoning averages.
+ */
+export async function getPriceBenchmark(db, { windowDays }) {
+  const [overall, bySku] = await Promise.all([
+    db.query(
+      `SELECT count(*)::bigint AS price_losses,
+              COALESCE(sum(estimated_revenue_lost), 0) AS revenue_lost,
+              round(avg((competitor_delta_payload->>'delta_cents')::bigint)) AS avg_delta_cents,
+              round(avg((competitor_delta_payload->>'our_price_cents')::bigint)) AS avg_our_price_cents,
+              round(avg((competitor_delta_payload->>'competitor_price_cents')::bigint)) AS avg_competitor_price_cents
+         FROM loss_diagnostics
+        WHERE calculated_loss_reason = 'PRICE_DISCREPANCY'
+          AND created_at >= now() - make_interval(days => $1)
+          AND (competitor_delta_payload->>'delta_cents') IS NOT NULL`,
+      [windowDays]
+    ),
+    db.query(
+      `SELECT target_sku,
+              count(*)::bigint AS losses,
+              round(avg((competitor_delta_payload->>'delta_cents')::bigint)) AS avg_delta_cents,
+              round(avg((competitor_delta_payload->>'our_price_cents')::bigint)) AS avg_our_price_cents,
+              round(avg((competitor_delta_payload->>'competitor_price_cents')::bigint)) AS avg_competitor_price_cents,
+              COALESCE(sum(estimated_revenue_lost), 0) AS revenue_lost
+         FROM loss_diagnostics
+        WHERE calculated_loss_reason = 'PRICE_DISCREPANCY'
+          AND created_at >= now() - make_interval(days => $1)
+          AND (competitor_delta_payload->>'delta_cents') IS NOT NULL
+        GROUP BY target_sku
+        ORDER BY sum(estimated_revenue_lost) DESC
+        LIMIT 20`,
+      [windowDays]
+    ),
+  ]);
+  const row = overall.rows[0];
+  const toNum = (v) => (v === null || v === undefined ? null : Number(v));
+  return {
+    price_losses: Number(row.price_losses),
+    revenue_lost: String(row.revenue_lost),
+    avg_delta_cents: toNum(row.avg_delta_cents),
+    avg_our_price_cents: toNum(row.avg_our_price_cents),
+    avg_competitor_price_cents: toNum(row.avg_competitor_price_cents),
+    by_sku: bySku.rows.map((r) => ({
+      sku: r.target_sku,
+      losses: Number(r.losses),
+      avg_delta_cents: toNum(r.avg_delta_cents),
+      avg_our_price_cents: toNum(r.avg_our_price_cents),
+      avg_competitor_price_cents: toNum(r.avg_competitor_price_cents),
+      revenue_lost: String(r.revenue_lost),
+    })),
+  };
+}

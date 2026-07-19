@@ -62,6 +62,11 @@ retries, DLQ) with zero extra infrastructure.
   (`lib/validate-telemetry.js` repairs what is safe, rejects what would corrupt
   attribution), shop-domain → merchant resolution through a 60s TTL cache, one
   multi-row parameterized INSERT per batch.
+- **Benchmark Engine** (`GET /analytics/benchmark`): aggregates the exact
+  integer-cents price evidence the loss classifier stores on
+  PRICE_DISCREPANCY diagnostics into the spec's headline insight — average
+  undercut when agents chose a competitor on price, plus a per-SKU reprice
+  worklist ranked by revenue impact.
 - **Context Reconstruction** (`lib/intent-classifier.js`): each stored intent
   is classified into a prompt-category taxonomy (GIFT_URGENT, PRICE_SENSITIVE,
   ECO_CONSCIOUS, REPLENISHMENT, ...) from explicit agent tags or free-text
