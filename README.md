@@ -60,7 +60,7 @@ flowchart LR
 | `db/` | PostgreSQL schema migrations + runner | SQL, `pg` |
 | `services/ingestion/` | Telemetry ingest, webhook receiver, attribution stitch, loss sweep, OAuth onboarding | Node.js, Express, `pg` |
 | `optimizer/` | Agent Match Score engine + CLI + HTTP microservice + JSON-LD rewriter + what-if simulator | Python 3.11, stdlib only |
-| `dashboard/` | Merchant dashboard: Loss Diagnosis, Data Optimizer, What-If Simulator | React 18, Vite |
+| `dashboard/` | Merchant dashboard: Loss Diagnosis, Agent Traffic, Data Optimizer, What-If Simulator | React 18, Vite |
 | `demo/` | One-command demo: mock Shopify storefront + agent traffic simulator | Node stdlib |
 | `docs/` | Architecture + local development guides | — |
 
@@ -111,7 +111,7 @@ Every suite runs offline — no network, no external services:
 
 ```bash
 cd edge && npm test                          # 40 tests — plain Node 22, no wrangler
-cd services/ingestion && npm test            # 96 tests — pure libs, pass before npm install
+cd services/ingestion && npm test            # 102 tests — pure libs, pass before npm install
 cd optimizer && python3 -m unittest discover # 135 tests — stdlib only (engine, JSON-LD, HTTP, simulator)
 cd dashboard && npm test && npm run build    # pure helpers + production build
 node --test demo/test/scenarios.test.mjs     # demo scenario generator

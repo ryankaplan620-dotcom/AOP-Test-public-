@@ -62,6 +62,11 @@ retries, DLQ) with zero extra infrastructure.
   (`lib/validate-telemetry.js` repairs what is safe, rejects what would corrupt
   attribution), shop-domain → merchant resolution through a 60s TTL cache, one
   multi-row parameterized INSERT per batch.
+- **Context Reconstruction** (`lib/intent-classifier.js`): each stored intent
+  is classified into a prompt-category taxonomy (GIFT_URGENT, PRICE_SENSITIVE,
+  ECO_CONSCIOUS, REPLENISHMENT, ...) from explicit agent tags or free-text
+  prompt fields, persisted in the `_edge` JSONB meta and served by
+  `GET /analytics/traffic` for the dashboard's Agent Traffic screen.
 - `POST /webhooks/shopify/orders-create` — the Webhook Receiver Engine. Raw-body
   HMAC-SHA256 verification (mounted before any JSON parser — Shopify signs the
   exact bytes), token extraction from `note_attributes`, attribution stitch,
