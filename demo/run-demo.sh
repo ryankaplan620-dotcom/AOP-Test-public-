@@ -28,7 +28,14 @@ cd "$ROOT"
 export INGEST_API_TOKEN="${INGEST_API_TOKEN:-dev-token}"
 export SHOPIFY_WEBHOOK_SECRET="${SHOPIFY_WEBHOOK_SECRET:-dev-secret}"
 export DASHBOARD_API_TOKEN="${DASHBOARD_API_TOKEN:-dev-dash-token}"
+# Two DISTINCT merchant identities, mirroring production Shopify:
+#   SHOP_DOMAIN      — the custom storefront origin hostname; the edge records
+#                      it as telemetry shop_domain (resolved via the generated
+#                      origin_hostname column, migration 0011).
+#   MYSHOPIFY_DOMAIN — the permanent *.myshopify.com key; real Shopify sends
+#                      THIS in X-Shopify-Shop-Domain on every webhook.
 SHOP_DOMAIN="${SHOP_DOMAIN:-redthreadapparel.com}"
+export MYSHOPIFY_DOMAIN="${MYSHOPIFY_DOMAIN:-redthread.myshopify.com}"
 
 # ---- 1. PostgreSQL ----------------------------------------------------------
 if [[ -z "${DATABASE_URL:-}" ]]; then
@@ -45,14 +52,18 @@ fi
 echo "[demo] applying migrations..."
 (cd db && npm install --silent --no-audit --no-fund >/dev/null && npm run migrate)
 
-echo "[demo] seeding merchant ${SHOP_DOMAIN}..."
+echo "[demo] seeding merchant ${MYSHOPIFY_DOMAIN} (origin https://${SHOP_DOMAIN})..."
 node - <<SEED
 import pg from './db/node_modules/pg/lib/index.js';
 const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
 await client.connect();
+// shopify_shop_domain = the *.myshopify.com webhook/OAuth key; origin_url =
+// the custom storefront the edge proxies to (telemetry resolves through its
+// generated origin_hostname). Seeding them differently exercises the same
+// split real Shopify production merchants have.
 await client.query(
-  "INSERT INTO merchant_profiles (shopify_shop_domain, access_token_encrypted) VALUES (\$1, 'enc:v1:demo') ON CONFLICT DO NOTHING",
-  ['${SHOP_DOMAIN}']
+  "INSERT INTO merchant_profiles (shopify_shop_domain, access_token_encrypted, origin_url) VALUES (\$1, 'enc:v1:demo', \$2) ON CONFLICT DO NOTHING",
+  ['${MYSHOPIFY_DOMAIN}', 'https://${SHOP_DOMAIN}']
 );
 await client.end();
 console.error('[demo] merchant ready');

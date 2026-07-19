@@ -316,11 +316,11 @@ it('returns a 502 JSON error when no origin can be resolved, without calling fet
   assert.equal(typeof body.message, 'string');
   assert.equal(calls.length, 0, 'must not dispatch to any origin (and must not loop to self)');
 
-  // Intent attempt is still recorded (shop_domain unknown, status 502).
+  // NO telemetry for unroutable traffic: a shop_domain-less record is
+  // rejected by the ingestion validator by contract, so queueing it would
+  // only burn a queue message per scanner hit (review finding).
   await flush(ctx);
-  assert.equal(sends.length, 1);
-  assert.equal(sends[0].status, 502);
-  assert.equal(sends[0].shop_domain, null);
+  assert.equal(sends.length, 0, 'unroutable requests must not queue telemetry');
 });
 
 it('a "//"-prefixed inbound path cannot override the origin host (SSRF regression)', async () => {

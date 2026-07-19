@@ -248,21 +248,14 @@ export default {
 
       if (!originBase) {
         // Unknown hostname and no DEFAULT_ORIGIN (or the route would loop back
-        // to this proxy itself): fail fast with a controlled 502. Still record
-        // the intent attempt — "misrouted agent traffic" is itself a
-        // drop-off diagnosis worth surfacing (shop_domain stays null).
+        // to this proxy itself): fail fast with a controlled 502. NO telemetry
+        // here — a record without a resolvable origin has shop_domain null,
+        // which the ingestion validator rejects by contract (shop_domain is
+        // the tenant key), so queueing it would only burn a queue message and
+        // inflate rejected_invalid on every scanner spray. If "misrouted
+        // agent traffic" analytics are ever wanted, that needs a dedicated
+        // sentinel + consumer, not a dead record.
         const latencyMs = Date.now() - startedAt;
-        if (intercepted) {
-          scheduleTelemetry(ctx, env, {
-            clonedRequest: telemetryClone,
-            url,
-            signature,
-            originBase: null,
-            method: request.method,
-            status: 502,
-            latencyMs,
-          });
-        }
         return errorResponse(
           502,
           'no_origin_configured',

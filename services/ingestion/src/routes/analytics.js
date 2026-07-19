@@ -97,17 +97,15 @@ export function buildAnalyticsRouter({ config, db, logger }) {
         window_days: windowDays,
         impressions: summary.impressions,
         orders_won: summary.orders_won,
-        gmv: summary.gmv,
-        commission: summary.commission,
-        // Billing credits (refunds/cancellations) in the window + the netted
-        // figures — gross minus credits, subtracted in SQL (repositories.js).
+        // MONEY is per-currency only (mirrors the billing contract): each
+        // entry carries gross, credits, and SQL-subtracted net figures.
+        // There are deliberately NO cross-currency scalar money totals.
+        currencies: summary.currencies,
         adjustments: summary.adjustments,
-        adjusted_gmv: summary.adjusted_gmv,
-        commission_credits: summary.commission_credits,
-        net_gmv: summary.net_gmv,
-        net_commission: summary.net_commission,
         conversion_rate_pct: conversionRatePct,
         losses: summary.losses,
+        // Heuristic cents from agent payloads — no currency evidence; render
+        // unlabeled, never with a currency symbol.
         estimated_losses: summary.estimated_losses,
         critical_dropoff: topPhase
           ? {

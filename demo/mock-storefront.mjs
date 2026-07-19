@@ -19,7 +19,10 @@
  *
  * Env: PORT (default 9100), INGEST_URL (default http://localhost:8787),
  *      SHOPIFY_WEBHOOK_SECRET (default dev-secret), SHOP_DOMAIN
- *      (default redthreadapparel.com — must match the seeded merchant row).
+ *      (default redthreadapparel.com — the storefront origin), and
+ *      MYSHOPIFY_DOMAIN (default redthread.myshopify.com — what real Shopify
+ *      sends in X-Shopify-Shop-Domain; must match the seeded
+ *      shopify_shop_domain).
  *
  * Plain Node stdlib — the demo adds zero dependencies.
  */
@@ -32,6 +35,11 @@ const PORT = Number(process.env.PORT ?? 9100);
 const INGEST_URL = (process.env.INGEST_URL ?? 'http://localhost:8787').replace(/\/+$/, '');
 const WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET ?? 'dev-secret';
 const SHOP_DOMAIN = process.env.SHOP_DOMAIN ?? 'redthreadapparel.com';
+// Real Shopify webhooks carry the permanent *.myshopify.com domain, NOT the
+// storefront's custom domain — the demo mirrors that so the identity split
+// (telemetry via origin_hostname vs webhooks via shopify_shop_domain) is
+// actually exercised instead of masked.
+const MYSHOPIFY_DOMAIN = process.env.MYSHOPIFY_DOMAIN ?? 'redthread.myshopify.com';
 
 const bySku = new Map(CATALOG.map((p) => [p.sku, p]));
 let orderSequence = 77000001; // fake Shopify order ids, monotonic
@@ -87,7 +95,7 @@ async function fireOrderWebhook({ token, orderTotal, sku }) {
     headers: {
       'content-type': 'application/json',
       'x-shopify-hmac-sha256': hmac,
-      'x-shopify-shop-domain': SHOP_DOMAIN,
+      'x-shopify-shop-domain': MYSHOPIFY_DOMAIN,
       'x-shopify-topic': 'orders/create',
     },
     body,

@@ -53,7 +53,10 @@ dead_letter_queue = "aop-edge-telemetry-dlq"
 [vars]
 # MERCHANT_ROUTES: JSON string mapping an incoming proxy hostname to the merchant
 # origin base URL the worker forwards to. The origin hostname is also recorded as
-# shop_domain in telemetry, which the ingestion service maps to a merchant_id.
+# shop_domain in telemetry; the ingestion service resolves it to a merchant_id by
+# matching EITHER merchant_profiles.shopify_shop_domain OR the origin_hostname
+# generated from origin_url (migration 0011) — so custom-domain origins resolve
+# as long as the merchant row's origin_url points at the same host as this route.
 MERCHANT_ROUTES = '{"agents.redthread.aop.network":"https://redthreadapparel.com"}'
 
 # DEFAULT_ORIGIN: fallback origin used when the incoming hostname has no entry in

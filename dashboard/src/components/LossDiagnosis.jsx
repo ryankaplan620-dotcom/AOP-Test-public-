@@ -105,15 +105,24 @@ export default function LossDiagnosis({ settings }) {
           value={summary ? formatCount(summary.orders_won) : '…'}
           note={
             summary
-              ? `Conv. rate: ${formatPct(summary.conversion_rate_pct)} · Net GMV ${formatMoney(summary.net_gmv ?? summary.gmv)}` +
+              ? `Conv. rate: ${formatPct(summary.conversion_rate_pct)}` +
+                // Per-currency net GMV — currencies never sum together, so a
+                // multi-currency window renders one figure per currency.
+                ((summary.currencies ?? []).length > 0
+                  ? ` · Net GMV ${(summary.currencies ?? [])
+                      .map((c) => formatMoney(c.net_gmv, c.currency))
+                      .join(' + ')}`
+                  : '') +
                 (summary.adjustments > 0 ? ` (${formatCount(summary.adjustments)} refunds/cancels)` : '')
               : ''
           }
         />
         <StatCard
           label="Estimated Losses"
-          value={summary ? formatMoney(summary.estimated_losses) : '…'}
-          note={summary ? `${formatCount(summary.losses)} lost intents` : ''}
+          // Heuristic estimate with no currency evidence — plain number, no
+          // currency symbol (a wrong "$" would be fabrication).
+          value={summary ? formatMoney(summary.estimated_losses, null) : '…'}
+          note={summary ? `${formatCount(summary.losses)} lost intents (est., merchant currency)` : ''}
           tone="losses"
         />
       </div>
@@ -152,7 +161,7 @@ export default function LossDiagnosis({ settings }) {
                   <td>{String(index + 1).padStart(2, '0')}</td>
                   <td>{lossReasonLabel(row.reason)}</td>
                   <td className="num">{formatPct(row.share_pct)}</td>
-                  <td className="num">{formatMoney(row.estimated_revenue_lost)}</td>
+                  <td className="num">{formatMoney(row.estimated_revenue_lost, null)}</td>
                   <td>
                     <div className="share-bar">
                       <div style={{ width: `${Math.min(100, row.share_pct)}%` }} />
@@ -172,9 +181,9 @@ export default function LossDiagnosis({ settings }) {
           <h2>Competitive Price Benchmark</h2>
           <p className="sub">
             When agents chose a competitor on price, you were undercut by an average of{' '}
-            <strong>{formatMoney(benchmark.avg_undercut)}</strong> (your avg{' '}
-            {formatMoney(benchmark.avg_our_price)} vs. their {formatMoney(benchmark.avg_competitor_price)}) —{' '}
-            {formatMoney(benchmark.revenue_lost)} of walked-away baskets across{' '}
+            <strong>{formatMoney(benchmark.avg_undercut, null)}</strong> (your avg{' '}
+            {formatMoney(benchmark.avg_our_price, null)} vs. their {formatMoney(benchmark.avg_competitor_price, null)}) —{' '}
+            {formatMoney(benchmark.revenue_lost, null)} of walked-away baskets across{' '}
             {formatCount(benchmark.price_losses)} losses. Reprice worklist, biggest impact first:
           </p>
           <table>
@@ -193,12 +202,12 @@ export default function LossDiagnosis({ settings }) {
                 <tr key={row.sku}>
                   <td>{row.sku}</td>
                   <td className="num">{formatCount(row.losses)}</td>
-                  <td className="num">{formatMoney(row.avg_our_price)}</td>
-                  <td className="num">{formatMoney(row.avg_competitor_price)}</td>
+                  <td className="num">{formatMoney(row.avg_our_price, null)}</td>
+                  <td className="num">{formatMoney(row.avg_competitor_price, null)}</td>
                   <td className="num" style={{ color: 'var(--lost)' }}>
-                    -{formatMoney(row.avg_undercut)}
+                    -{formatMoney(row.avg_undercut, null)}
                   </td>
-                  <td className="num">{formatMoney(row.revenue_lost)}</td>
+                  <td className="num">{formatMoney(row.revenue_lost, null)}</td>
                 </tr>
               ))}
             </tbody>
@@ -229,7 +238,9 @@ export default function LossDiagnosis({ settings }) {
                   <td>{event.target_sku}</td>
                   <td className={`outcome-${event.outcome}`}>{event.outcome}</td>
                   <td>{lossReasonLabel(event.detail)}</td>
-                  <td className="num">{formatMoney(event.amount)}</td>
+                  {/* WON rows carry the order currency; LOST rows are
+                      currency-less estimates and render unlabeled. */}
+                  <td className="num">{formatMoney(event.amount, event.currency)}</td>
                 </tr>
               ))}
             </tbody>

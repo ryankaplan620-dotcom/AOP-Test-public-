@@ -51,6 +51,40 @@ export async function findMerchantByShopDomain(db, shopDomain) {
 }
 
 /**
+ * Merchant resolution for TELEMETRY records (routes/telemetry.js).
+ *
+ * The edge records shop_domain = the resolved ORIGIN hostname, while
+ * shopify_shop_domain holds the *.myshopify.com key Shopify uses on
+ * webhooks/OAuth. For custom-domain merchants (origin_url points at their
+ * primary storefront domain — the standard production setup) the two differ,
+ * so telemetry must match EITHER: the myshopify domain (merchants whose
+ * origin IS their myshopify storefront) or origin_hostname (migration 0011,
+ * generated from origin_url).
+ *
+ * Webhooks deliberately do NOT use this lookup: their identity is the
+ * HMAC-verified Shopify header, and widening that key would let a
+ * misconfigured origin_url capture another merchant's orders.
+ *
+ * ORDER BY prefers the exact shop-domain match if both somehow hit (e.g. an
+ * operator pointed merchant B's origin_url at merchant A's myshopify domain).
+ * Both predicates are index-backed (0002 functional unique + 0011 partial).
+ *
+ * @returns {Promise<{id: string, shopify_shop_domain: string}|null>}
+ */
+export async function findMerchantForTelemetry(db, hostname) {
+  const result = await db.query(
+    `SELECT id, shopify_shop_domain
+       FROM merchant_profiles
+      WHERE lower(shopify_shop_domain) = lower($1)
+         OR origin_hostname = lower($1)
+      ORDER BY (lower(shopify_shop_domain) = lower($1)) DESC
+      LIMIT 1`,
+    [hostname]
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
  * Batch-insert intent logs as ONE multi-row INSERT.
  *
  * A single statement (vs N inserts) is what keeps the firehose cheap: one
@@ -411,61 +445,94 @@ export async function insertLossDiagnostic(
  * and estimated revenue lost. Scalar subqueries instead of joins — the three
  * tables aggregate independently and a join would multiply rows.
  *
- * gmv/commission are GROSS (as charged); the adjustments pair reports what
- * refunds/cancellations credited back in the same window, and net_* subtracts
- * them IN SQL (NUMERIC arithmetic — money never floats in JS).
+ * Counts are currency-free scalars. MONEY is reported per currency
+ * (`currencies[]`, mirroring the billing statement's contract from migration
+ * 0010): a EUR order and a USD order must never sum into one number, so no
+ * cross-currency scalar totals exist in this response at all. Net figures
+ * are subtracted in SQL (NUMERIC — money never floats in JS).
+ * estimated_losses stays a scalar because loss estimates are heuristic cents
+ * derived from agent payloads with no currency evidence; consumers render it
+ * as an unlabeled number, never with a currency symbol.
  *
  * @param {object} db
  * @param {{windowDays: number}} options
- * @returns {Promise<{impressions: number, orders_won: number, gmv: string,
- *   commission: string, adjustments: number, adjusted_gmv: string,
- *   commission_credits: string, net_gmv: string, net_commission: string,
- *   estimated_losses: string, losses: number}>}
+ * @returns {Promise<{impressions: number, orders_won: number,
+ *   adjustments: number, losses: number, estimated_losses: string,
+ *   currencies: Array<{currency: string, orders: number, gmv: string,
+ *     commission: string, adjustments: number, adjusted_gmv: string,
+ *     commission_credits: string, net_gmv: string, net_commission: string}>}>}
  */
 export async function getAnalyticsSummary(db, { windowDays }) {
-  const result = await db.query(
-    `SELECT
-       (SELECT count(*) FROM agent_intent_logs
-         WHERE processed_at >= now() - make_interval(days => $1))            AS impressions,
-       (SELECT count(*) FROM reconciled_agent_orders
-         WHERE reconciled_at >= now() - make_interval(days => $1))           AS orders_won,
-       (SELECT COALESCE(sum(gross_merchandise_value), 0) FROM reconciled_agent_orders
-         WHERE reconciled_at >= now() - make_interval(days => $1))           AS gmv,
-       (SELECT COALESCE(sum(commission_fee), 0) FROM reconciled_agent_orders
-         WHERE reconciled_at >= now() - make_interval(days => $1))           AS commission,
-       (SELECT count(*) FROM order_adjustments
-         WHERE adjusted_at >= now() - make_interval(days => $1))             AS adjustments,
-       (SELECT COALESCE(sum(adjusted_gmv), 0) FROM order_adjustments
-         WHERE adjusted_at >= now() - make_interval(days => $1))             AS adjusted_gmv,
-       (SELECT COALESCE(sum(commission_credit), 0) FROM order_adjustments
-         WHERE adjusted_at >= now() - make_interval(days => $1))             AS commission_credits,
-       (SELECT count(*) FROM loss_diagnostics
-         WHERE created_at >= now() - make_interval(days => $1))              AS losses,
-       (SELECT COALESCE(sum(estimated_revenue_lost), 0) FROM loss_diagnostics
-         WHERE created_at >= now() - make_interval(days => $1))              AS estimated_losses`,
-    [windowDays]
-  );
-  const row = result.rows[0];
-  // Net figures subtracted in SQL on the same NUMERIC values — JS float
-  // subtraction on money strings is banned. One extra round-trip is fine on
-  // a dashboard read path.
-  const netResult = await db.query(
-    `SELECT ($1::numeric - $2::numeric)::text AS net_gmv,
-            ($3::numeric - $4::numeric)::text AS net_commission`,
-    [row.gmv, row.adjusted_gmv, row.commission, row.commission_credits]
-  );
+  const [counts, money] = await Promise.all([
+    db.query(
+      `SELECT
+         (SELECT count(*) FROM agent_intent_logs
+           WHERE processed_at >= now() - make_interval(days => $1))            AS impressions,
+         (SELECT count(*) FROM reconciled_agent_orders
+           WHERE reconciled_at >= now() - make_interval(days => $1))           AS orders_won,
+         (SELECT count(*) FROM order_adjustments
+           WHERE adjusted_at >= now() - make_interval(days => $1))             AS adjustments,
+         (SELECT count(*) FROM loss_diagnostics
+           WHERE created_at >= now() - make_interval(days => $1))              AS losses,
+         (SELECT COALESCE(sum(estimated_revenue_lost), 0) FROM loss_diagnostics
+           WHERE created_at >= now() - make_interval(days => $1))              AS estimated_losses`,
+      [windowDays]
+    ),
+    // Charges and credits per currency, FULL OUTER JOINed exactly like the
+    // billing statement (a window can be credits-only for a currency).
+    db.query(
+      `WITH charges AS (
+          SELECT COALESCE(currency, 'UNSPECIFIED') AS currency,
+                 count(*)::bigint AS orders,
+                 sum(gross_merchandise_value) AS gmv,
+                 sum(commission_fee) AS commission
+            FROM reconciled_agent_orders
+           WHERE reconciled_at >= now() - make_interval(days => $1)
+           GROUP BY COALESCE(currency, 'UNSPECIFIED')
+       ),
+       credits AS (
+          SELECT COALESCE(r.currency, 'UNSPECIFIED') AS currency,
+                 count(*)::bigint AS adjustments,
+                 sum(a.adjusted_gmv) AS adjusted_gmv,
+                 sum(a.commission_credit) AS commission_credits
+            FROM order_adjustments a
+            JOIN reconciled_agent_orders r ON r.id = a.reconciled_order_id
+           WHERE a.adjusted_at >= now() - make_interval(days => $1)
+           GROUP BY COALESCE(r.currency, 'UNSPECIFIED')
+       )
+       SELECT COALESCE(c.currency, cr.currency) AS currency,
+              COALESCE(c.orders, 0) AS orders,
+              COALESCE(c.gmv, 0) AS gmv,
+              COALESCE(c.commission, 0) AS commission,
+              COALESCE(cr.adjustments, 0) AS adjustments,
+              COALESCE(cr.adjusted_gmv, 0) AS adjusted_gmv,
+              COALESCE(cr.commission_credits, 0) AS commission_credits,
+              (COALESCE(c.gmv, 0) - COALESCE(cr.adjusted_gmv, 0)) AS net_gmv,
+              (COALESCE(c.commission, 0) - COALESCE(cr.commission_credits, 0)) AS net_commission
+         FROM charges c
+         FULL OUTER JOIN credits cr ON cr.currency = c.currency
+        ORDER BY COALESCE(c.gmv, 0) DESC`,
+      [windowDays]
+    ),
+  ]);
+  const row = counts.rows[0];
   return {
     impressions: Number(row.impressions),
     orders_won: Number(row.orders_won),
-    gmv: String(row.gmv),
-    commission: String(row.commission),
     adjustments: Number(row.adjustments),
-    adjusted_gmv: String(row.adjusted_gmv),
-    commission_credits: String(row.commission_credits),
-    net_gmv: String(netResult.rows[0].net_gmv),
-    net_commission: String(netResult.rows[0].net_commission),
     losses: Number(row.losses),
     estimated_losses: String(row.estimated_losses),
+    currencies: money.rows.map((r) => ({
+      currency: r.currency,
+      orders: Number(r.orders),
+      gmv: String(r.gmv),
+      commission: String(r.commission),
+      adjustments: Number(r.adjustments),
+      adjusted_gmv: String(r.adjusted_gmv),
+      commission_credits: String(r.commission_credits),
+      net_gmv: String(r.net_gmv),
+      net_commission: String(r.net_commission),
+    })),
   };
 }
 
@@ -515,6 +582,10 @@ export async function getLossPhaseBreakdown(db, { windowDays }) {
  * their denormalized fields). The outer ORDER BY + LIMIT bounds the read.
  */
 export async function getRecentActivity(db, { limit }) {
+  // currency: WON rows carry the reconciled order's ISO code (migration
+  // 0010); LOST rows carry NULL — loss estimates are heuristic cents with no
+  // currency evidence, and labeling them would be fabrication. The dashboard
+  // renders NULL/unknown as a plain unlabeled number.
   const result = await db.query(
     `SELECT * FROM (
         SELECT d.created_at                        AS occurred_at,
@@ -522,7 +593,8 @@ export async function getRecentActivity(db, { limit }) {
                COALESCE(i.protocol_type, 'UNKNOWN_PROTOCOL') AS protocol,
                d.target_sku                        AS target_sku,
                d.calculated_loss_reason            AS detail,
-               d.estimated_revenue_lost::text      AS amount
+               d.estimated_revenue_lost::text      AS amount,
+               NULL::text                          AS currency
           FROM loss_diagnostics d
           LEFT JOIN agent_intent_logs i ON i.id = d.intent_log_id
         UNION ALL
@@ -531,7 +603,8 @@ export async function getRecentActivity(db, { limit }) {
                COALESCE(i.protocol_type, 'UNKNOWN_PROTOCOL') AS protocol,
                COALESCE(i.target_sku, 'UNSPECIFIED') AS target_sku,
                'RECONCILED_ORDER'                  AS detail,
-               r.gross_merchandise_value::text     AS amount
+               r.gross_merchandise_value::text     AS amount,
+               r.currency::text                    AS currency
           FROM reconciled_agent_orders r
           LEFT JOIN agent_intent_logs i ON i.id = r.intent_log_id
      ) activity

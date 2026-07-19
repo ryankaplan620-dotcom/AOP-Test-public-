@@ -23,12 +23,15 @@ idempotent (advisory-locked, transaction-per-file).
 ## 2. Seed a merchant
 
 The proxy records the **origin hostname** as `shop_domain`; the ingestion service
-maps it to a merchant row. Seed one that matches your route config:
+resolves it against `shopify_shop_domain` OR the `origin_hostname` generated from
+`origin_url` (migration 0011). Real Shopify webhooks, by contrast, always carry
+the permanent `*.myshopify.com` domain. Seed the two identities the way
+production has them — myshopify key + custom-domain origin:
 
 ```bash
 psql postgres://aop:aop@localhost:5432/aop <<'SQL'
-INSERT INTO merchant_profiles (shopify_shop_domain, access_token_encrypted)
-VALUES ('redthreadapparel.com', 'enc:v1:placeholder-ciphertext')
+INSERT INTO merchant_profiles (shopify_shop_domain, access_token_encrypted, origin_url)
+VALUES ('redthread.myshopify.com', 'enc:v1:placeholder-ciphertext', 'https://redthreadapparel.com')
 ON CONFLICT DO NOTHING;
 SQL
 ```
@@ -93,7 +96,7 @@ HMAC=$(node -e "console.log(require('crypto').createHmac('sha256','dev-secret').
 
 curl -s -X POST http://localhost:8787/webhooks/shopify/orders-create \
   -H "Content-Type: application/json" \
-  -H "X-Shopify-Shop-Domain: redthreadapparel.com" \
+  -H "X-Shopify-Shop-Domain: redthread.myshopify.com" \
   -H "X-Shopify-Hmac-Sha256: $HMAC" \
   -d "$BODY"
 # -> {"ok":true,"action":"reconciled", ...}
