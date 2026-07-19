@@ -402,3 +402,30 @@ export async function getRecentActivity(db, { limit }) {
   );
   return result.rows;
 }
+
+/**
+ * Merchant onboarding upsert (routes/oauth.js): install or re-install.
+ *
+ * ON CONFLICT targets the functional unique index on lower(domain)
+ * (migration 0002) so 'Shop.myshopify.com' vs 'shop.myshopify.com' hit the
+ * same row. A re-install refreshes the encrypted token in place — the
+ * merchant id (and every FK pointing at it) is stable across reinstalls.
+ *
+ * @param {object} db
+ * @param {{shopDomain: string, encryptedToken: string}} merchant
+ *   shopDomain MUST be pre-validated (normalizeShopDomain); encryptedToken is
+ *   lib/token-crypto.js ciphertext — NEVER a plaintext token.
+ * @returns {Promise<{id: string, shopify_shop_domain: string}>}
+ */
+export async function upsertMerchantToken(db, { shopDomain, encryptedToken }) {
+  const result = await db.query(
+    `INSERT INTO merchant_profiles (shopify_shop_domain, access_token_encrypted)
+     VALUES ($1, $2)
+     ON CONFLICT ((lower(shopify_shop_domain)))
+     DO UPDATE SET access_token_encrypted = EXCLUDED.access_token_encrypted,
+                   updated_at = now()
+     RETURNING id, shopify_shop_domain`,
+    [shopDomain, encryptedToken]
+  );
+  return result.rows[0];
+}
