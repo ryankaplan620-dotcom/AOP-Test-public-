@@ -53,3 +53,15 @@ test('percentShare rounds to one decimal and never yields NaN', () => {
   assert.equal(percentShare(5, 0), 0);
   assert.equal(percentShare('x', 10), 0);
 });
+
+test('parseBillingMonth validates, clamps, and defaults to the current month', async () => {
+  const { parseBillingMonth } = await import('../src/lib/analytics-params.js');
+  const now = new Date('2026-07-19T12:00:00Z');
+  assert.deepEqual(parseBillingMonth('2026-06', now), { label: '2026-06', startDate: '2026-06-01' });
+  assert.deepEqual(parseBillingMonth(undefined, now), { label: '2026-07', startDate: '2026-07-01' });
+  assert.equal(parseBillingMonth('2026-13', now).label, '2026-07', 'invalid month -> current');
+  assert.equal(parseBillingMonth('2027-01', now).label, '2026-07', 'future -> current');
+  assert.equal(parseBillingMonth('2019-12', now).label, '2026-07', 'pre-2020 -> current');
+  assert.equal(parseBillingMonth('garbage', now).label, '2026-07');
+  assert.equal(parseBillingMonth(['2026-05', '2026-06'], now).label, '2026-05', 'first of repeated params');
+});

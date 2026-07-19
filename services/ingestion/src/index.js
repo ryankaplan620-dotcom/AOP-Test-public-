@@ -24,6 +24,7 @@ import { loadConfig, ConfigError } from './config.js';
 import { createDbPool } from './db.js';
 import { buildApp } from './app.js';
 import { startLossSweep } from './jobs/loss-sweep.js';
+import { startRetentionSweep } from './jobs/retention-sweep.js';
 import { createLogger } from './lib/logger.js';
 
 const logger = createLogger('ingestion');
@@ -70,6 +71,8 @@ async function main() {
 
   // ---- 4. loss sweep ------------------------------------------------------
   const sweep = startLossSweep({ db, config, logger: logger.child('loss-sweep') });
+  // Compliance retention: enforce the 90-day telemetry cap in-process.
+  const retention = startRetentionSweep({ db, config, logger: logger.child('retention') });
 
   // ---- 5. graceful shutdown ----------------------------------------------
   let shuttingDown = false;
@@ -88,8 +91,9 @@ async function main() {
     watchdog.unref();
 
     try {
-      // (a) stop generating DB work; awaits any in-flight sweep pass.
+      // (a) stop generating DB work; awaits any in-flight sweep passes.
       await sweep.stop();
+      await retention.stop();
 
       // (b) stop accepting connections; resolves when in-flight requests end.
       await new Promise((resolve) => {
