@@ -374,3 +374,25 @@ class TestReviewRegressionFixes(unittest.TestCase):
             self.assertNotIn("restocking_fee", [p.code for p in m.hidden_penalties], text)
         m = parse_policy_semantics("We charge a 15% restocking fee.")
         self.assertIn("restocking_fee", [p.code for p in m.hidden_penalties])
+
+    def test_spend_qualifiers_stay_conditional(self):
+        for text in (
+            "Free shipping when you spend over $50.",
+            "Free shipping if you spend at least $50.",
+            "Spend over $75 to unlock free shipping.",
+        ):
+            m = parse_policy_semantics(text)
+            self.assertTrue(m.free_shipping_conditional, text)
+
+    def test_returns_verb_store_credit_is_penalized_but_opt_in_is_not(self):
+        for text in (
+            "Items may be returned for store credit within 30 days.",
+            "Returns are accepted within 30 days for store credit.",
+            "All returns are exchanged for store credit.",
+        ):
+            m = parse_policy_semantics(text)
+            self.assertIn("store_credit_only", [p.code for p in m.hidden_penalties], text)
+        m = parse_policy_semantics(
+            "Returns accepted; you may choose a refund or opt for store credit."
+        )
+        self.assertNotIn("store_credit_only", [p.code for p in m.hidden_penalties])

@@ -19,6 +19,7 @@
 
 import express from 'express';
 import { buildRateLimiter } from './lib/rate-limit.js';
+import { timingSafeTokenCheck } from './lib/auth.js';
 import { buildTelemetryRouter } from './routes/telemetry.js';
 import { buildWebhooksRouter } from './routes/webhooks.js';
 import { buildAnalyticsRouter } from './routes/analytics.js';
@@ -59,6 +60,19 @@ export function buildApp({ config, db, logger }) {
   // client error but DATA LOSS (the queue consumer retries the same
   // too-big batch until it dead-letters). Everything else keeps a tight
   // 2mb: no other route legitimately carries big bodies.
+  //
+  // AUTH BEFORE PARSE: the bearer token lives in a header, so an
+  // unauthenticated caller must be 401'd before we spend CPU/memory parsing
+  // up to 24mb of their JSON. The router's own timing-safe check remains as
+  // defense in depth (this gate uses the same comparator).
+  app.use('/ingest', (req, res, next) => {
+    const match = /^Bearer\s+(.+)$/i.exec(req.get('authorization') ?? '');
+    if (!timingSafeTokenCheck(match ? match[1].trim() : null, config.ingestApiToken)) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    next();
+  });
   app.use('/ingest', express.json({ limit: '24mb' }));
   app.use(express.json({ limit: '2mb' }));
 
@@ -90,15 +104,27 @@ export function buildApp({ config, db, logger }) {
   // ingest hot path uses. 5s staleness is irrelevant to LB semantics.
   const HEALTH_CACHE_MS = 5_000;
   let healthCache = { at: 0, ok: false };
+  let healthProbe = null; // in-flight dedup: concurrent probes share ONE query
   app.get('/healthz', async (_req, res) => {
     if (Date.now() - healthCache.at >= HEALTH_CACHE_MS) {
-      try {
-        await db.query('SELECT 1');
-        healthCache = { at: Date.now(), ok: true };
-      } catch (err) {
-        logger.error('healthz database ping failed', { err });
-        healthCache = { at: Date.now(), ok: false };
+      // Single-flight: N concurrent /healthz hits during a slow/failing DB
+      // must issue ONE SELECT 1, not N (a saturated pool would otherwise
+      // queue an unauthenticated waiter per request). Every waiter shares
+      // the same probe promise; the completion stamps the cache once.
+      if (healthProbe === null) {
+        healthProbe = (async () => {
+          try {
+            await db.query('SELECT 1');
+            healthCache = { at: Date.now(), ok: true };
+          } catch (err) {
+            logger.error('healthz database ping failed', { err });
+            healthCache = { at: Date.now(), ok: false };
+          } finally {
+            healthProbe = null;
+          }
+        })();
       }
+      await healthProbe;
     }
     if (healthCache.ok) {
       res.status(200).json({ status: 'ok' });

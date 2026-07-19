@@ -358,6 +358,22 @@ export async function insertOrderAdjustment(db, { merchantId, shopifyOrderId, so
 }
 
 /**
+ * Lightweight order presence probe for the orphan-replay protocol: is this
+ * Shopify order reconciled yet, and which intent (if any) is it stitched to?
+ * @returns {Promise<{id: string, intent_log_id: string|null}|null>}
+ */
+export async function findReconciledOrderByShopifyId(db, { merchantId, shopifyOrderId }) {
+  const result = await db.query(
+    `SELECT id, intent_log_id
+       FROM reconciled_agent_orders
+      WHERE merchant_id = $1 AND shopify_order_id = $2
+      LIMIT 1`,
+    [merchantId, shopifyOrderId]
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
  * Park a credit whose order has not been reconciled yet (migration 0012).
  * ON CONFLICT: webhook redelivery of an already-parked credit is a no-op.
  * @returns {Promise<{inserted: boolean}>}
@@ -495,6 +511,24 @@ export async function findExpiredUnreconciledIntents(db, { expirySeconds, limit,
 }
 
 /**
+ * The DB's own view of the sweep frontier (now() - expiry), captured BEFORE
+ * a sweep fetch. Using the DATABASE clock for both the eligibility predicate
+ * and the drained-frontier watermark removes app-vs-DB clock skew from the
+ * safety argument entirely (the 60s read slack then only has to cover batch
+ * micro-offsets), and capturing it PRE-fetch means rows becoming eligible
+ * during a slow pass stay above the watermark for the next tick.
+ * @returns {Promise<string>} ISO timestamp.
+ */
+export async function getSweepFrontier(db, expirySeconds) {
+  const result = await db.query(
+    `SELECT (now() - make_interval(secs => $1))::timestamptz AS frontier`,
+    [expirySeconds]
+  );
+  const value = result.rows[0].frontier;
+  return value instanceof Date ? value.toISOString() : String(value);
+}
+
+/**
  * Sweep watermark persistence (sweep_state, migration 0012).
  * getSweepWatermark returns the ISO watermark or null (first run).
  */
@@ -540,11 +574,25 @@ export async function insertLossDiagnostic(
   { merchantId, intentLogId, targetSku, reason, estimatedRevenueLost, competitorDelta }
 ) {
   const deltaJson = competitorDelta === null || competitorDelta === undefined ? null : JSON.stringify(competitorDelta);
+  // INSERT..SELECT..WHERE NOT EXISTS re-asserts non-reconciliation AT WRITE
+  // TIME: the sweep's eligibility anti-joins ran at FETCH time, and an order
+  // reconciling in between (whose reversal DELETE ran before this insert)
+  // would otherwise leave a false LOST verdict that nothing ever reverses.
+  // Token-based suppression mirrors the fetch query, including the anonymous
+  // sentinel exemption.
   const result = await db.query(
     `INSERT INTO loss_diagnostics
         (merchant_id, intent_log_id, target_sku, calculated_loss_reason,
          estimated_revenue_lost, competitor_delta_payload)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+     SELECT $1, $2, $3, $4, $5, $6::jsonb
+      WHERE NOT EXISTS (
+              SELECT 1 FROM reconciled_agent_orders r WHERE r.intent_log_id = $2)
+        AND NOT EXISTS (
+              SELECT 1 FROM reconciled_agent_orders r
+                JOIN agent_intent_logs i ON i.id = $2
+               WHERE r.merchant_id = $1
+                 AND i.transaction_token <> 'headless_anonymous'
+                 AND r.transaction_token = i.transaction_token)
      ON CONFLICT (intent_log_id) DO NOTHING`,
     [merchantId, intentLogId, targetSku, reason, estimatedRevenueLost, deltaJson]
   );
@@ -628,6 +676,13 @@ export async function getAnalyticsSummary(db, { windowDays }) {
                      COALESCE(sum(a.commission_credit) FILTER (WHERE a.adjusted_at < now() - make_interval(days => $1)), 0) AS prior_credit
                 FROM order_adjustments a
                 JOIN reconciled_agent_orders r ON r.id = a.reconciled_order_id
+               -- Bound the scan to orders that actually have an in-window
+               -- adjustment (index probe on adjusted_at) BEFORE computing
+               -- their lifetime totals — without this the CTE re-aggregates
+               -- the entire historical ledger on every dashboard poll.
+               WHERE a.reconciled_order_id IN (
+                       SELECT DISTINCT w.reconciled_order_id FROM order_adjustments w
+                        WHERE w.adjusted_at >= now() - make_interval(days => $1))
                GROUP BY r.id, COALESCE(r.currency, 'UNSPECIFIED'), r.commission_fee
               HAVING count(*) FILTER (WHERE a.adjusted_at >= now() - make_interval(days => $1)) > 0
             ) oc
@@ -891,7 +946,12 @@ export async function getBillingStatement(db, { monthStartDate }) {
               FROM order_adjustments a
               JOIN reconciled_agent_orders r ON r.id = a.reconciled_order_id
               CROSS JOIN bounds b
+             -- Same in-window pre-filter as the summary CTE: only orders with
+             -- an adjustment in the statement month need lifetime totals.
              WHERE a.adjusted_at < b.month_end
+               AND a.reconciled_order_id IN (
+                     SELECT DISTINCT w.reconciled_order_id FROM order_adjustments w, bounds wb
+                      WHERE w.adjusted_at >= wb.month_start AND w.adjusted_at < wb.month_end)
              GROUP BY r.id, r.merchant_id, r.currency, r.commission_fee, b.month_start
             HAVING count(*) FILTER (WHERE a.adjusted_at >= b.month_start) > 0
           ) oc

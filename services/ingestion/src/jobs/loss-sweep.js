@@ -31,6 +31,7 @@ import {
   insertLossDiagnostic,
   getSweepWatermark,
   setSweepWatermark,
+  getSweepFrontier,
 } from '../repositories.js';
 
 /**
@@ -118,6 +119,18 @@ export function startLossSweep({ db, config, logger }) {
       logger.warn('loss sweep watermark unavailable; scanning unbounded this tick', { err });
     }
 
+    // Frontier captured from the DATABASE clock BEFORE the fetch: the
+    // drained-branch watermark below must never advance past an instant
+    // whose rows this pass could not have seen. Pre-fetch capture covers
+    // slow passes (rows becoming eligible mid-pass stay above it); the DB
+    // clock removes app-vs-DB skew from the safety argument.
+    let frontier = null;
+    try {
+      frontier = await getSweepFrontier(db, config.intentExpirySeconds);
+    } catch (err) {
+      logger.warn('loss sweep could not read the DB frontier; watermark will not advance this tick', { err });
+    }
+
     let rows;
     try {
       rows = await findExpiredUnreconciledIntents(db, {
@@ -178,13 +191,14 @@ export function startLossSweep({ db, config, logger }) {
       try {
         const next =
           rows.length < SWEEP_BATCH_SIZE
-            ? // Frontier drained: everything older than the expiry cutoff is
-              // fully processed as of this pass.
-              new Date(Date.now() - config.intentExpirySeconds * 1000).toISOString()
+            ? // Frontier drained: everything older than the PRE-FETCH DB
+              // frontier is fully processed. null frontier (probe failed)
+              // -> skip advancement rather than trust the app clock.
+              frontier
             : // Full batch: processed through the newest row we actually saw
               // (rows are oldest-first, so the last one is the newest).
               new Date(rows[rows.length - 1].processed_at).toISOString();
-        await setSweepWatermark(db, SWEEP_JOB_NAME, next);
+        if (next !== null) await setSweepWatermark(db, SWEEP_JOB_NAME, next);
       } catch (err) {
         // Non-fatal: the next tick just rescans from the old watermark.
         logger.warn('loss sweep could not persist watermark', { err });

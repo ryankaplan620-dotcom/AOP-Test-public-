@@ -148,11 +148,20 @@ function scrubString(value) {
   return { value: scrubbed, hits };
 }
 
+/**
+ * Plausible postal/region token: short alphanumeric with spaces/dashes and a
+ * bounded digit count (covers US 90210 / 90210-1234, CA "M5V 3A8", UK
+ * "SW1A 1AA", EU numerics). Accepted verbatim under allowlisted geo keys
+ * BEFORE the value scrubber runs — a ZIP+4 must not be eaten as a "phone".
+ * Digit bound (<=9) keeps actual phone numbers out of the fast path.
+ */
+const GEO_VALUE_SHAPE = /^(?=(?:[^0-9]*[0-9]){0,9}[^0-9]*$)[A-Za-z0-9][A-Za-z0-9 -]{0,11}$/;
+
 /** Recursion depth cap — JSON.parse output is acyclic but agents control its
  * shape; a 64-level bound makes pathological nesting a non-issue. */
 const MAX_DEPTH = 64;
 
-function redactValue(value, depth, counter) {
+function redactValue(value, depth, counter, insideAddress = false) {
   if (depth > MAX_DEPTH) return null; // drop absurdly deep subtrees outright
 
   if (typeof value === 'string') {
@@ -161,7 +170,7 @@ function redactValue(value, depth, counter) {
     return scrubbed;
   }
   if (Array.isArray(value)) {
-    return value.map((entry) => redactValue(entry, depth + 1, counter));
+    return value.map((entry) => redactValue(entry, depth + 1, counter, insideAddress));
   }
   if (value && typeof value === 'object') {
     const out = {};
@@ -170,20 +179,24 @@ function redactValue(value, depth, counter) {
       if (GEO_ALLOWLIST.has(normalized)) {
         // Coarse geo is the one thing we are allowed to keep — but only when
         // the VALUE actually looks like a geo token. An allowlisted key must
-        // not become a smuggling channel ("state": "john@x.com 555-0100"):
-        // real zip/state/country values are short and pass the same
-        // value-based scrub as everything else, so anything the scrubber
-        // flags (or an implausibly long value) is redacted, not kept.
+        // not become a smuggling channel ("state": "john@x.com 555-0100").
+        // Order matters: postal-code SHAPES are accepted FIRST ("90210-1234"
+        // would otherwise trip the phone scrubber), then anything the value
+        // scrubber flags (or an implausibly long value) is redacted.
         if (typeof entry === 'string') {
-          const { hits } = scrubString(entry);
-          if (hits > 0 || entry.length > 64) {
-            counter.hits += 1;
-            out[key] = REDACTED;
-          } else {
+          if (GEO_VALUE_SHAPE.test(entry)) {
             out[key] = entry;
+          } else {
+            const { hits } = scrubString(entry);
+            if (hits > 0 || entry.length > 64) {
+              counter.hits += 1;
+              out[key] = REDACTED;
+            } else {
+              out[key] = entry;
+            }
           }
         } else if (typeof entry === 'object' && entry !== null) {
-          out[key] = redactValue(entry, depth + 1, counter);
+          out[key] = redactValue(entry, depth + 1, counter, insideAddress);
         } else {
           out[key] = entry;
         }
@@ -191,21 +204,35 @@ function redactValue(value, depth, counter) {
       }
       if (PII_KEYS.has(normalized)) {
         // "address" is a CONTAINER in ACP/AP2 payloads: its children carry
-        // both street lines (PII, redacted by their own keys) and the geo
-        // fields the memo allows (zip/state/country). Walking it preserves
-        // the allowed granularity; a blanket REDACTED would destroy it.
-        // Every other PII key (names, emails, address_line ARRAYS of street
-        // strings, ...) is redacted wholesale — walking those could leak
-        // free-text fragments the value scrubber cannot recognize.
+        // both street lines (PII) and the geo fields the memo allows
+        // (zip/state/country). It is walked in ALLOWLIST-ONLY mode (the
+        // insideAddress flag): inside an address, every child that is not on
+        // the geo allowlist is redacted regardless of its key name — an
+        // unanticipated field under an address (dependentLocality, district,
+        // organization, any protocol-specific street key) is location PII by
+        // context and must never rely on key/value pattern recognition.
         if (normalized === 'address' && entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
-          out[key] = redactValue(entry, depth + 1, counter);
+          out[key] = redactValue(entry, depth + 1, counter, true);
           continue;
         }
         counter.hits += 1;
         out[key] = REDACTED;
         continue;
       }
-      out[key] = redactValue(entry, depth + 1, counter);
+      if (insideAddress) {
+        // Allowlist-only zone: reaching here means the key is neither geo-
+        // allowlisted nor a known PII key — inside an address container that
+        // still means "location data we did not anticipate". Redact scalars;
+        // keep walking containers in the same mode.
+        if (entry !== null && typeof entry === 'object') {
+          out[key] = redactValue(entry, depth + 1, counter, true);
+        } else {
+          counter.hits += 1;
+          out[key] = REDACTED;
+        }
+        continue;
+      }
+      out[key] = redactValue(entry, depth + 1, counter, insideAddress);
     }
     return out;
   }
@@ -260,13 +287,24 @@ export function redactQueryString(search) {
     let redactions = 0;
     const out = new URLSearchParams();
     for (const [key, value] of params) {
+      // PHP/Rails-style nested params name the real field in the LAST
+      // bracket or dot segment (shipping[address1], customer.email) — the
+      // full key would normalize to "shippingaddress1" and miss the PII
+      // list. Check the leaf segment as well as the whole key.
+      const bracketLeaf = /\[([^\]]*)\]\s*$/.exec(key)?.[1];
+      const dotLeaf = key.includes('.') ? key.split('.').pop() : null;
+      const leaf = normalizeKey(bracketLeaf ?? dotLeaf ?? key);
       const normalized = normalizeKey(key);
-      if (PII_KEYS.has(normalized)) {
+      if (PII_KEYS.has(normalized) || PII_KEYS.has(leaf)) {
         redactions += 1;
         out.append(key, REDACTED);
         continue;
       }
-      if (GEO_ALLOWLIST.has(normalized)) {
+      if (GEO_ALLOWLIST.has(normalized) || GEO_ALLOWLIST.has(leaf)) {
+        if (GEO_VALUE_SHAPE.test(value)) {
+          out.append(key, value);
+          continue;
+        }
         const { hits } = scrubString(value);
         if (hits > 0 || value.length > 64) {
           redactions += 1;

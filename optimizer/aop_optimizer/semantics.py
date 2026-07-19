@@ -480,15 +480,16 @@ _FREE_SHIP_COND_RES = [
         rf"\b[^.!?\n]{{0,40}}?\b(?:ships?\s+free|free\s+shipping)",
         re.IGNORECASE,
     ),
-    # "spend $75 for free shipping" / "spend $75+ to unlock free shipping"
+    # "spend $75 for free shipping" / "spend over $75 to unlock free shipping"
     re.compile(
-        rf"\bspend\s+\$?\s*{_MONEY}\s*\+?\b[^.!?\n]{{0,40}}?\bfree\s+shipping",
+        rf"\bspend\s+(?:over|above|at\s+least|more\s+than|a\s+minimum\s+of)?\s*\$?\s*{_MONEY}\s*\+?\b[^.!?\n]{{0,40}}?\bfree\s+shipping",
         re.IGNORECASE,
     ),
-    # "free shipping when you spend $50" / "free shipping if you spend $50+"
+    # "free shipping when you spend $50" / "free shipping if you spend over $50"
     re.compile(
         rf"\bfree\s+(?:standard\s+|ground\s+|express\s+)?shipping\b"
-        rf"[^.!?\n]{{0,40}}?\b(?:when|if|once)\s+you\s+spend\s+\$?\s*{_MONEY}",
+        rf"[^.!?\n]{{0,40}}?\b(?:when|if|once)\s+you\s+spend\s+"
+        rf"(?:over|above|at\s+least|more\s+than|a\s+minimum\s+of)?\s*\$?\s*{_MONEY}",
         re.IGNORECASE,
     ),
     # "free shipping on orders $50+" / "free shipping on orders of $75 or more"
@@ -600,8 +601,14 @@ _STORE_CREDIT_RE = re.compile(
     r"(?:as|in|to|via)\s+store[\s-]*credit\b"
     # NOTE: no bare "(for|as|in) store credit" branch — "you may opt for
     # store credit" merely OFFERS credit as an option and must not be
-    # penalized as credit-ONLY; exclusivity requires "only" adjacency.
-    r"|\b(?:for|as|in)\s+store[\s-]*credit\s+only\b)",
+    # penalized as credit-ONLY; exclusivity requires "only" adjacency OR a
+    # returns-verb subject within a short gap (below): "returned for store
+    # credit" states the policy outcome, while opt-in phrasings put the
+    # choice words ("you may choose a refund or opt for...") in between and
+    # overflow the 30-char gap.
+    r"|\b(?:for|as|in)\s+store[\s-]*credit\s+only\b"
+    r"|\breturn(?:s|ed)?\b[^.!?\n]{0,30}?\b(?:for|as|in|to)\s+store[\s-]*credit\b"
+    r"|\bexchang(?:e|ed|es)\b[^.!?\n]{0,30}?\bfor\s+store[\s-]*credit\b)",
     re.IGNORECASE,
 )
 

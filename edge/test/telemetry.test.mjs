@@ -440,3 +440,35 @@ it('geo-allowlisted keys cannot smuggle PII values', async () => {
   assert.ok(!flat.includes('555-0100'), 'phone smuggled under "state" is redacted');
   assert.ok(flat.includes('94103'), 'plausible zip kept');
 });
+
+it('redacts PII under bracketed/dotted query param names and keeps ZIP+4', async () => {
+  const url =
+    'https://proxy.example/shipping_quote?shipping%5Baddress1%5D=9%20Elm%20Grove&customer.email=a%40b.com&zip=90210-1234&sku=S1';
+  const record = await buildTelemetryRecord(null, url, META);
+  assert.ok(!record.query.includes('Elm'), 'bracketed street leaf redacted');
+  assert.ok(!record.query.includes('a%40b.com') && !record.query.includes('a@b.com'), 'dotted email leaf redacted');
+  assert.ok(record.query.includes('90210-1234'), 'ZIP+4 survives (not eaten as phone)');
+  assert.ok(record.query.includes('sku=S1'));
+});
+
+it('address containers are allowlist-only: unanticipated sub-fields are redacted', async () => {
+  const body = JSON.stringify({
+    address: {
+      dependent_locality: 'Small Village',
+      district: 'Westside',
+      zip: '10001-4321',
+      country: 'US',
+    },
+  });
+  const request = new Request('https://proxy.example/shipping_quote', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  });
+  const record = await buildTelemetryRecord(request, request.url, META);
+  const flat = JSON.stringify(record.inbound_payload);
+  assert.ok(!flat.includes('Small Village'), 'sub-locality redacted by default');
+  assert.ok(!flat.includes('Westside'), 'district redacted by default');
+  assert.ok(flat.includes('10001-4321'), 'ZIP+4 survives');
+  assert.ok(flat.includes('US'), 'country survives');
+});

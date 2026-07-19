@@ -84,7 +84,14 @@ function stripNulCharacters(value, depth = 0) {
   if (typeof value === 'string') {
     return value.includes('\u0000') ? value.split('\u0000').join('') : value;
   }
-  if (value === null || typeof value !== 'object' || depth > 32) return value;
+  if (value === null || typeof value !== 'object') return value;
+  // FAIL CLOSED at the depth cap: returning the raw subtree would pass
+  // un-scrubbed NULs straight through to the batch INSERT -- the exact
+  // poisoning this function exists to stop. Dropping an absurdly deep
+  // subtree loses nothing legitimate. Cap 128 comfortably exceeds the edge
+  // redactor's own 64-level bound, so no edge-preserved payload can ever
+  // reach this branch.
+  if (depth > 128) return null;
   if (Array.isArray(value)) return value.map((entry) => stripNulCharacters(entry, depth + 1));
   const out = {};
   for (const [key, entry] of Object.entries(value)) {

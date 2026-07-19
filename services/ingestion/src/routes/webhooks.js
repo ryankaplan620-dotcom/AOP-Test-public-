@@ -46,6 +46,7 @@ import {
   findAdjustmentOrphansForOrder,
   deleteAdjustmentOrphan,
   deleteLossDiagnosticForIntent,
+  findReconciledOrderByShopifyId,
 } from '../repositories.js';
 
 /** The note_attributes/attributes key agents echo the edge token under. */
@@ -230,11 +231,23 @@ function refundedAmount(refund) {
     sawAmount = true;
     lineTotal += subtotal;
     // Charged GMV (order.total_price) includes tax; the credit must too.
+    // KNOWN BOUNDED TRADEOFF: on tax-INCLUSIVE (VAT) stores, subtotal may
+    // already contain the tax, making this a slight over-credit for partial
+    // refunds — the refund payload carries no taxes_included flag to
+    // distinguish. Over-credit is merchant-favorable and hard-capped by the
+    // per-order GMV clamp + per-order fee clamp; the alternative
+    // (skipping tax) under-credits every US-style store, which is the
+    // dispute-generating direction. Transactions remain the primary,
+    // exact source — this branch only runs when they are absent.
     const tax = parseMoneyToCents(line.total_tax);
     if (tax !== null) lineTotal += tax;
   }
   // Shipping refunds live in order_adjustments (amounts are negative in
-  // Shopify's convention; take magnitudes).
+  // Shopify's convention; take magnitudes). ONLY kind 'shipping_refund' is
+  // credited: 'refund_discrepancy' entries are SIGNED corrections in either
+  // direction, and abs-summing them would manufacture credit out of a
+  // correction that reduced the refund. Excluding them can only
+  // under-credit (merchant disputes surface; silent over-credit does not).
   const magnitudeCents = (value) => {
     if (typeof value === 'number') return parseMoneyToCents(Math.abs(value));
     if (typeof value === 'string') return parseMoneyToCents(value.replace(/^\s*-/, ''));
@@ -243,6 +256,7 @@ function refundedAmount(refund) {
   const adjustments = Array.isArray(refund?.order_adjustments) ? refund.order_adjustments : [];
   for (const adj of adjustments.slice(0, 100)) {
     if (adj === null || typeof adj !== 'object') continue;
+    if (adj.kind !== 'shipping_refund') continue;
     const amount = magnitudeCents(adj.amount);
     if (amount === null) continue;
     sawAmount = true;
@@ -356,8 +370,20 @@ export function buildWebhooksRouter({ config, db, logger }) {
 
         if (!inserted) {
           // ON CONFLICT fired: Shopify redelivered a webhook we already
-          // billed. The UNIQUE constraint is the idempotency backstop —
-          // acknowledge so redelivery stops.
+          // billed. The row is the idempotency backstop — but the ORIGINAL
+          // delivery may have crashed between committing the order and
+          // running the post-reconciliation side effects, so run them here
+          // too (both are idempotent: DELETE of nothing + ON CONFLICT
+          // ledger inserts). This is what un-strands parked credits after a
+          // partial failure.
+          const existing = await findReconciledOrderByShopifyId(db, {
+            merchantId: merchant.id,
+            shopifyOrderId,
+          });
+          if (existing?.intent_log_id) {
+            await deleteLossDiagnosticForIntent(db, existing.intent_log_id);
+          }
+          await replayParkedCredits(merchant.id, shopifyOrderId);
           logger.info('shopify order already reconciled (webhook redelivery)', {
             shopify_order_id: shopifyOrderId,
           });
@@ -382,26 +408,7 @@ export function buildWebhooksRouter({ config, db, logger }) {
         // does not order deliveries across topics): each parked orphan runs
         // through the normal ledger insert — same clamp, same idempotency —
         // then leaves the parking lot.
-        const orphans = await findAdjustmentOrphansForOrder(db, {
-          merchantId: merchant.id,
-          shopifyOrderId,
-        });
-        for (const orphan of orphans) {
-          const { status } = await insertOrderAdjustment(db, {
-            merchantId: merchant.id,
-            shopifyOrderId,
-            sourceEventId: orphan.source_event_id,
-            kind: orphan.adjustment_kind,
-            requestedGmv: orphan.requested_gmv,
-            requestedCurrency: orphan.requested_currency ?? null,
-          });
-          await deleteAdjustmentOrphan(db, orphan.id);
-          logger.info('replayed parked credit after late order reconciliation', {
-            shopify_order_id: shopifyOrderId,
-            source_event_id: orphan.source_event_id,
-            outcome: status,
-          });
-        }
+        await replayParkedCredits(merchant.id, shopifyOrderId);
 
         logger.info('order reconciled to agent intent', {
           shop_domain: shopDomain,
@@ -420,6 +427,36 @@ export function buildWebhooksRouter({ config, db, logger }) {
       }
     }
   );
+
+  /**
+   * Drain the orphan parking lot for one order through the normal ledger
+   * insert (same clamp, same source_event_id idempotency). Runs on EVERY
+   * path that observes a reconciled order — first delivery, webhook
+   * redelivery, and immediately after parking a credit whose order raced in
+   * — so a parked credit can never be stranded by crash/redelivery/race
+   * interleavings. Idempotent throughout: replaying twice is a no-op.
+   * @returns {Promise<number>} orphans processed.
+   */
+  async function replayParkedCredits(merchantId, shopifyOrderId) {
+    const orphans = await findAdjustmentOrphansForOrder(db, { merchantId, shopifyOrderId });
+    for (const orphan of orphans) {
+      const { status } = await insertOrderAdjustment(db, {
+        merchantId,
+        shopifyOrderId,
+        sourceEventId: orphan.source_event_id,
+        kind: orphan.adjustment_kind,
+        requestedGmv: orphan.requested_gmv,
+        requestedCurrency: orphan.requested_currency ?? null,
+      });
+      await deleteAdjustmentOrphan(db, orphan.id);
+      logger.info('replayed parked credit', {
+        shopify_order_id: shopifyOrderId,
+        source_event_id: orphan.source_event_id,
+        outcome: status,
+      });
+    }
+    return orphans.length;
+  }
 
   /**
    * Shared tail for the two credit topics: run the ledger insert and map its
@@ -466,6 +503,21 @@ export function buildWebhooksRouter({ config, db, logger }) {
         requestedGmv: adjustment.requestedGmv,
         requestedCurrency: adjustment.requestedCurrency ?? null,
       });
+      // TOCTOU closure: the order may have reconciled BETWEEN the ledger's
+      // order_not_found check and the park above (its replay pass would then
+      // have seen an empty lot). Re-check now that the orphan is durably
+      // committed; if the order exists, replay immediately -- one of the two
+      // writers is guaranteed to see the other's committed row.
+      const nowReconciled = await findReconciledOrderByShopifyId(db, {
+        merchantId: adjustment.merchantId,
+        shopifyOrderId: adjustment.shopifyOrderId,
+      });
+      if (nowReconciled !== null) {
+        await replayParkedCredits(adjustment.merchantId, adjustment.shopifyOrderId);
+        logger.info('credit parked then immediately replayed (order raced in)', log);
+        res.status(200).json({ ok: true, action: 'credit_replayed' });
+        return;
+      }
       logger.info(
         inserted
           ? 'credit parked: order not reconciled (yet); will replay if it lands'
