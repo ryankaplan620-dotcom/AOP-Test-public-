@@ -12,6 +12,7 @@
 import React, { useState } from 'react';
 import { rewritePolicy } from '../api.js';
 import { formatPct } from '../format.js';
+import ClaimInjector from './ClaimInjector.jsx';
 
 const SAMPLE_POLICY =
   'We charge a 15% restocking fee for items sent back. All sales are eligible ' +
@@ -166,6 +167,8 @@ export default function DataOptimizer({ settings }) {
           ) : null}
         </>
       ) : null}
+
+      <ClaimInjector settings={settings} />
     </div>
   );
 }

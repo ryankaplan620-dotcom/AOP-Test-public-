@@ -117,6 +117,21 @@ parsed ("current", an honest restatement) and with directive targets applied
 round-trips through our own parser to a score of 100 (tested). Binds
 127.0.0.1 by default; expected to sit behind the merchant app's auth.
 
+### The Structured Claim Injector (`optimizer/aop_optimizer/claims.py`)
+
+Spec feature C's second lever: audits a raw product record for the claim
+classes agents weight (precise dimensions, shipping weight, materials,
+curated third-party certifications, durability/warranty, GTIN, country of
+origin — weights sum to 100 so the claims score reads as a percentage) and
+injects every VERIFIED claim into a schema.org Product JSON-LD block
+(`certification`, `width/height/depth` QuantitativeValues,
+`hasWarrantyPromise`, `gtin`, ...). Missing claims become directives, never
+fabricated properties — the injector structures the merchant's existing
+facts and refuses to invent them (compliance memo: fabricated claims to win
+a bid can be wire fraud). Exposed as `POST /claims` on the optimizer
+microservice and as the Structured Claim Injector section of the Data
+Optimizer tab.
+
 ### The Merchant Dashboard (`dashboard/` — React SPA)
 
 The Loss Diagnosis screen from the product wireframe: stat cards (agent
