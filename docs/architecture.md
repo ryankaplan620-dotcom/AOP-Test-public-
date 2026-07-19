@@ -184,4 +184,6 @@ From the AOP data-privacy memo ("pass-through analytics processor"):
 - **90-day retention**: `purge_expired_telemetry(retention_days, batch_size)`
   (migration `0006`) deletes expired `agent_intent_logs` in ctid-bounded batches
   — dependent `loss_diagnostics` cascade; `reconciled_agent_orders` (billing)
-  are never purged. Schedule it via pg_cron or any external scheduler.
+  are never purged. Enforced automatically by the ingestion service's
+  in-process retention sweep (`jobs/retention-sweep.js`, every 6h by default);
+  pg_cron remains a fine alternative — the purge is idempotent.

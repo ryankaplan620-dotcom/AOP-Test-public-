@@ -11,6 +11,7 @@
  *   /analytics/loss-reasons?days=7  ranked loss reasons with revenue + share
  *   /analytics/activity?limit=50    interleaved WON/LOST live stream
  *   /analytics/traffic?days=7       protocol share, prompt categories, top SKUs
+ *   /analytics/billing?month=YYYY-MM monthly commission statement per merchant
  *
  * Security model:
  *   - Read-only aggregates; no per-consumer PII exists downstream anyway
@@ -27,13 +28,14 @@
 
 import express from 'express';
 import { timingSafeTokenCheck } from '../lib/auth.js';
-import { parseWindowDays, parseLimit, percentShare } from '../lib/analytics-params.js';
+import { parseWindowDays, parseLimit, percentShare, parseBillingMonth } from '../lib/analytics-params.js';
 import {
   getAnalyticsSummary,
   getLossReasonBreakdown,
   getLossPhaseBreakdown,
   getRecentActivity,
   getTrafficBreakdown,
+  getBillingStatement,
 } from '../repositories.js';
 
 /**
@@ -145,6 +147,36 @@ export function buildAnalyticsRouter({ config, db, logger }) {
           share_pct: percentShare(c.count, intentTotal),
         })),
         top_skus: breakdown.top_skus,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- GET /analytics/billing ----------------------------------------------
+  router.get('/billing', async (req, res, next) => {
+    try {
+      const { label, startDate } = parseBillingMonth(req.query.month);
+      const lines = await getBillingStatement(db, { monthStartDate: startDate });
+      // Totals in integer cents — never float-sum decimal strings.
+      const cents = (v) => Math.round(Number(v) * 100);
+      const totals = lines.reduce(
+        (acc, line) => ({
+          orders: acc.orders + line.orders,
+          gmv_cents: acc.gmv_cents + cents(line.gmv),
+          commission_cents: acc.commission_cents + cents(line.commission),
+        }),
+        { orders: 0, gmv_cents: 0, commission_cents: 0 },
+      );
+      const decimal = (c) => `${Math.floor(c / 100)}.${String(c % 100).padStart(2, '0')}`;
+      res.json({
+        month: label,
+        lines,
+        totals: {
+          orders: totals.orders,
+          gmv: decimal(totals.gmv_cents),
+          commission: decimal(totals.commission_cents),
+        },
       });
     } catch (err) {
       next(err);

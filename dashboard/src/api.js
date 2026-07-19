@@ -103,6 +103,12 @@ export function fetchTraffic(settings, days) {
   });
 }
 
+export function fetchBilling(settings, month) {
+  return request(`${baseOf(settings.analyticsUrl)}/analytics/billing?month=${month}`, {
+    token: settings.dashboardToken,
+  });
+}
+
 export function fetchActivity(settings, limit) {
   return request(`${baseOf(settings.analyticsUrl)}/analytics/activity?limit=${limit}`, {
     token: settings.dashboardToken,

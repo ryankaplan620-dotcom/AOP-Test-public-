@@ -58,3 +58,26 @@ export function percentShare(part, total) {
   if (!Number.isFinite(p) || !Number.isFinite(t) || t <= 0) return 0;
   return Math.round((p / t) * 1000) / 10;
 }
+
+/**
+ * Billing-month param: ?month=YYYY-MM -> validated {label, startDate} where
+ * startDate is the 'YYYY-MM-01' string the SQL layer casts to date. Missing
+ * or malformed input defaults to the CURRENT month (UTC) — the statement a
+ * merchant most often wants. Months before 2020 or in the future clamp to
+ * the current month (there can be no billing data there).
+ *
+ * @param {unknown} raw query-string value.
+ * @param {Date} [now] injected clock for tests.
+ * @returns {{label: string, startDate: string}}
+ */
+export function parseBillingMonth(raw, now = new Date()) {
+  const current = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+  const candidate = Array.isArray(raw) ? raw[0] : raw;
+  const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(String(candidate ?? '').trim());
+  let label = current;
+  if (match) {
+    const year = Number(match[1]);
+    if (year >= 2020 && match[0] <= current) label = match[0];
+  }
+  return { label, startDate: `${label}-01` };
+}

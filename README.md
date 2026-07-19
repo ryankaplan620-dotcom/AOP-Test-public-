@@ -128,6 +128,8 @@ cd db && node --check migrate.mjs            # runner syntax; SQL verified again
 | `PORT` | ingestion | HTTP port (default `8787`) |
 | `INTENT_EXPIRY_SECONDS` | ingestion | Conversion window before an intent counts as lost (default `60`) |
 | `LOSS_SWEEP_INTERVAL_MS` | ingestion | Loss-sweep cadence (default `15000`) |
+| `RETENTION_DAYS` | ingestion | Telemetry retention cap enforced in-process (default `90`) |
+| `RETENTION_SWEEP_INTERVAL_MS` | ingestion | Retention purge cadence (default `21600000` = 6h) |
 | `MERCHANT_ROUTES` | edge (`[vars]`) | JSON map: proxy hostname → merchant origin base URL |
 | `DEFAULT_ORIGIN` | edge (`[vars]`) | Fallback origin; empty = 502 unknown hostnames |
 | `INGEST_API_URL` | edge (`[vars]`) | Base URL of the ingestion service |
@@ -149,6 +151,7 @@ Per the AOP data-privacy memo, the platform is a *pass-through analytics process
 - **Data residency.** Records carry `user_geo` (from `X-User-Geo` /
   Cloudflare geo-IP) and a derived `data_region` (`eu`/`row`) so EU telemetry can
   be routed to EU infrastructure.
-- **90-day retention cap.** `SELECT * FROM purge_expired_telemetry();`
-  (db migration `0006`) deletes expired intent telemetry in bounded batches;
-  billing records (`reconciled_agent_orders`) are never purged.
+- **90-day retention cap, enforced automatically.** The ingestion service runs
+  an in-process retention sweep (every 6h, `RETENTION_DAYS` default 90) calling
+  `purge_expired_telemetry()` (db migration `0006`) — expired intent telemetry
+  is deleted in bounded batches; billing records are never purged.

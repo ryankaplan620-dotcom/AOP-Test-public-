@@ -122,6 +122,18 @@ export function loadConfig(env = process.env) {
     max: 3600000,
   });
 
+  // Retention (compliance memo: 90-day cap). retentionDays bounds how long
+  // intent telemetry lives; the in-process sweep enforces it every
+  // retentionSweepIntervalMs (default 6h). Billing rows are never purged.
+  const retentionDays = parsePositiveInt(env, 'RETENTION_DAYS', 90, problems, {
+    min: 1,
+    max: 3650,
+  });
+  const retentionSweepIntervalMs = parsePositiveInt(env, 'RETENTION_SWEEP_INTERVAL_MS', 21600000, problems, {
+    min: 60000, // sub-minute purge polling is pointless load
+    max: 86400000,
+  });
+
   // --- dashboard analytics (optional feature) ----------------------------
   // DASHBOARD_API_TOKEN gates the read-only /analytics/* routes consumed by
   // the merchant Loss Diagnosis dashboard. OPTIONAL by design: deployments
@@ -184,6 +196,8 @@ export function loadConfig(env = process.env) {
     port,
     intentExpirySeconds,
     lossSweepIntervalMs,
+    retentionDays,
+    retentionSweepIntervalMs,
     dashboardApiToken,
     dashboardAllowedOrigin,
     // null when the onboarding feature group is not configured; the /auth

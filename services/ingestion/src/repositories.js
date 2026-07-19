@@ -475,3 +475,42 @@ export async function getTrafficBreakdown(db, { windowDays }) {
     top_skus: skus.rows.map((r) => ({ sku: r.target_sku, probes: Number(r.probes) })),
   };
 }
+
+/**
+ * Monthly commission billing statement (routes/analytics.js).
+ *
+ * reconciled_agent_orders is the billing source of truth (commission_fee is
+ * the schema's generated column) — this query only aggregates it, per
+ * merchant, for one calendar month. The month bound is a 'YYYY-MM-01'
+ * string cast to date; half-open interval so month boundaries never
+ * double-count an order.
+ */
+export async function getBillingStatement(db, { monthStartDate }) {
+  const result = await db.query(
+    `SELECT m.id AS merchant_id,
+            m.shopify_shop_domain,
+            count(*)::bigint AS orders,
+            sum(r.gross_merchandise_value) AS gmv,
+            sum(r.commission_fee) AS commission,
+            -- rate snapshots can differ across rows after a rate change;
+            -- surface the range so statements stay explainable.
+            min(r.commission_rate) AS min_rate,
+            max(r.commission_rate) AS max_rate
+       FROM reconciled_agent_orders r
+       JOIN merchant_profiles m ON m.id = r.merchant_id
+      WHERE r.reconciled_at >= $1::date
+        AND r.reconciled_at < ($1::date + interval '1 month')
+      GROUP BY m.id, m.shopify_shop_domain
+      ORDER BY sum(r.commission_fee) DESC`,
+    [monthStartDate]
+  );
+  return result.rows.map((row) => ({
+    merchant_id: row.merchant_id,
+    shop_domain: row.shopify_shop_domain,
+    orders: Number(row.orders),
+    gmv: String(row.gmv),
+    commission: String(row.commission),
+    min_rate: String(row.min_rate),
+    max_rate: String(row.max_rate),
+  }));
+}
