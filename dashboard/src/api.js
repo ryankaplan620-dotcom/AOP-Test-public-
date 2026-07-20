@@ -128,6 +128,17 @@ export function fetchActivity(settings, limit) {
   });
 }
 
+/**
+ * Credential scope introspection: {role: 'platform'|'merchant', merchant_id,
+ * shop_domain}. The Settings tab uses it to verify a pasted credential and
+ * show whether this dashboard sees all merchants or one shop.
+ */
+export function fetchWhoami(settings) {
+  return request(`${baseOf(settings.analyticsUrl)}/analytics/whoami`, {
+    token: settings.dashboardToken,
+  });
+}
+
 // ---- Data Optimizer (optimizer microservice) ------------------------------
 
 /** Full rewrite pass: score + directives + the JSON-LD artifact. */

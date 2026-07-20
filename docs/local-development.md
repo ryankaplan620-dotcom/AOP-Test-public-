@@ -144,11 +144,32 @@ cd ../dashboard && npm install && npm run dev            # Vite dev server
 ```
 
 Open the dev URL, go to **Settings**, set the ingestion URL
-(`http://localhost:8787`), the `DASHBOARD_API_TOKEN` value you started the
-service with, and the optimizer URL (`http://localhost:8899`). The Loss
-Diagnosis tab then shows the seeded metrics live; the Data Optimizer tab runs
-the scan end-to-end. (Set `DASHBOARD_API_TOKEN` when starting the ingestion
-service in step 3 — without it the /analytics routes answer 503.)
+(`http://localhost:8787`), an access credential (below), and the optimizer URL
+(`http://localhost:8899`). The Loss Diagnosis tab then shows the seeded
+metrics live; the Data Optimizer tab runs the scan end-to-end. (Set
+`DASHBOARD_API_TOKEN` when starting the ingestion service in step 3 — without
+it the /analytics routes answer 503.)
+
+Two credential classes work in the Settings token field (use **Verify
+access** to confirm which scope you got):
+
+- the platform `DASHBOARD_API_TOKEN` — sees every merchant, or
+- a per-merchant API key, scoped to one shop. Mint one with the platform
+  token (the plaintext `api_key` is shown exactly once — only its SHA-256
+  digest is stored):
+
+```bash
+curl -s -X POST http://localhost:8787/analytics/keys \
+  -H "Authorization: Bearer $DASHBOARD_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"shop_domain": "redthread.myshopify.com", "label": "local dev"}'
+# -> {"api_key": "aop_live_…", "key_prefix": "aop_live_xxxx", ...}
+
+curl -s http://localhost:8787/analytics/keys \
+  -H "Authorization: Bearer $DASHBOARD_API_TOKEN"           # inventory
+curl -s -X DELETE http://localhost:8787/analytics/keys/<id> \
+  -H "Authorization: Bearer $DASHBOARD_API_TOKEN"           # revoke
+```
 
 ## 9. Score a store policy
 

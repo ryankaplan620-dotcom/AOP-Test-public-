@@ -6,22 +6,41 @@
  *     --(repositories analytics reads)--> THIS ROUTER
  *     --JSON--> [dashboard SPA: stat cards, drop-off analysis, loss tables]
  *
- * Endpoints (all GET, all bearer-gated by DASHBOARD_API_TOKEN):
- *   /analytics/summary?days=7       stat-card numbers + conversion rate
- *   /analytics/loss-reasons?days=7  ranked loss reasons with revenue + share
- *   /analytics/activity?limit=50    interleaved WON/LOST live stream
- *   /analytics/traffic?days=7       protocol share, prompt categories, top SKUs
- *   /analytics/billing?month=YYYY-MM monthly commission statement per merchant
- *   /analytics/benchmark?days=7     price-competitiveness benchmark (Benchmark Engine)
+ * Endpoints (bearer-gated; platform token OR merchant API key):
+ *   GET /analytics/summary?days=7       stat-card numbers + conversion rate
+ *   GET /analytics/loss-reasons?days=7  ranked loss reasons with revenue + share
+ *   GET /analytics/activity?limit=50    interleaved WON/LOST live stream
+ *   GET /analytics/traffic?days=7       protocol share, prompt categories, top SKUs
+ *   GET /analytics/billing?month=YYYY-MM monthly commission statement per merchant
+ *   GET /analytics/benchmark?days=7     price-competitiveness benchmark (Benchmark Engine)
+ *   GET /analytics/whoami               credential scope introspection
+ * Key management (platform token ONLY):
+ *   POST   /analytics/keys              mint a merchant key (plaintext shown once)
+ *   GET    /analytics/keys[?merchant_id=] list keys (prefixes only, never hashes)
+ *   DELETE /analytics/keys/:id          revoke (idempotent tombstone)
  *
- * Security model:
+ * Security model (multi-tenant since migration 0014):
  *   - Read-only aggregates; no per-consumer PII exists downstream anyway
  *     (redacted at the edge before storage).
- *   - Bearer auth with the same timing-safe comparison as the ingest route,
- *     but a SEPARATE credential: the dashboard must never hold the edge
- *     pipeline's write token.
+ *   - TWO credential classes on one bearer header:
+ *       platform — DASHBOARD_API_TOKEN, compared timing-safely; sees every
+ *                  merchant and manages keys. SEPARATE from the edge
+ *                  pipeline's write token by design.
+ *       merchant — an 'aop_live_…' API key (lib/api-keys.js); resolved by
+ *                  SHA-256 digest against merchant_api_keys and scoped to
+ *                  exactly that merchant_id in every repository query.
+ *     The platform check runs FIRST and the key path is shape-gated, so a
+ *     platform token never costs a DB round trip.
+ *   - UNIFORM 401 for every credential failure — missing header, malformed
+ *     bearer, unknown key, revoked key — so a probe learns nothing about
+ *     which stage rejected it.
+ *   - Key management (/analytics/keys) is PLATFORM-ONLY: merchants use keys,
+ *     they never mint them. A valid merchant key on an admin route is an
+ *     authenticated-but-unauthorized 403 (no oracle: the route's existence
+ *     is public in this open-source codebase anyway).
  *   - When DASHBOARD_API_TOKEN is unset the feature is OFF: uniform 503 on
- *     every route — an explicit "not configured" signal, never a bypass.
+ *     every route — an explicit "not configured" signal, never a bypass
+ *     (merchant keys are unusable too: key auth requires the feature on).
  *   - CORS is enabled for config.dashboardAllowedOrigin (the SPA runs on a
  *     different origin in dev). Token-gated + cookie-less, so reflecting a
  *     wildcard origin leaks nothing that the token doesn't already gate.
@@ -29,6 +48,7 @@
 
 import express from 'express';
 import { timingSafeTokenCheck } from '../lib/auth.js';
+import { isApiKeyShaped, hashApiKey, generateApiKey } from '../lib/api-keys.js';
 import { parseWindowDays, parseLimit, percentShare, parseBillingMonth } from '../lib/analytics-params.js';
 import {
   getAnalyticsSummary,
@@ -38,7 +58,15 @@ import {
   getTrafficBreakdown,
   getBillingStatement,
   getPriceBenchmark,
+  findMerchantByShopDomain,
+  findMerchantByApiKeyHash,
+  insertMerchantApiKey,
+  listMerchantApiKeys,
+  revokeMerchantApiKey,
 } from '../repositories.js';
+
+/** Postgres UUID literal gate: bad ids become clean 4xx, never a 22P02 500. */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Build the analytics router.
@@ -52,7 +80,7 @@ export function buildAnalyticsRouter({ config, db, logger }) {
   // ---- CORS (this router only; the write surface stays same-origin) ------
   router.use((req, res, next) => {
     res.set('Access-Control-Allow-Origin', config.dashboardAllowedOrigin);
-    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
     if (req.method === 'OPTIONS') {
       res.status(204).end();
@@ -62,27 +90,77 @@ export function buildAnalyticsRouter({ config, db, logger }) {
   });
 
   // ---- feature gate + auth (uniform responses, no oracles) ---------------
-  router.use((req, res, next) => {
+  // Resolves req.aopAuth = {role: 'platform'|'merchant', merchantId,
+  // shopDomain}. Every data route below scopes its repository call with
+  // req.aopAuth.merchantId (null = platform-wide).
+  router.use(async (req, res, next) => {
     if (config.dashboardApiToken === null) {
       res.status(503).json({ error: 'analytics disabled (DASHBOARD_API_TOKEN not configured)' });
       return;
     }
     const match = /^Bearer\s+(.+)$/i.exec(req.get('authorization') ?? '');
     const presented = match ? match[1].trim() : null;
-    if (!timingSafeTokenCheck(presented, config.dashboardApiToken)) {
-      res.status(401).json({ error: 'unauthorized' });
+
+    // 1. Platform token (timing-safe: a human-chosen secret).
+    if (timingSafeTokenCheck(presented, config.dashboardApiToken)) {
+      req.aopAuth = { role: 'platform', merchantId: null, shopDomain: null };
+      next();
       return;
     }
-    next();
+
+    // 2. Merchant API key: shape gate first (no DB probe for arbitrary
+    // bearers), then digest lookup (see lib/api-keys.js for why the hash
+    // lookup needs no constant-time comparison).
+    if (isApiKeyShaped(presented)) {
+      let merchant;
+      try {
+        merchant = await findMerchantByApiKeyHash(db, hashApiKey(presented));
+      } catch (err) {
+        // DB failure is a server fault, not a credential verdict — the
+        // central handler answers an opaque 500; never a false 401.
+        next(err);
+        return;
+      }
+      if (merchant) {
+        req.aopAuth = { role: 'merchant', merchantId: merchant.merchant_id, shopDomain: merchant.shop_domain };
+        next();
+        return;
+      }
+    }
+
+    // 3. UNIFORM rejection: missing, malformed, unknown, and revoked all
+    // land here with an identical response.
+    res.status(401).json({ error: 'unauthorized' });
+  });
+
+  /** Admin gate for key management: merchants never manage keys. */
+  function platformOnly(req, res) {
+    if (req.aopAuth.role !== 'platform') {
+      res.status(403).json({ error: 'forbidden' });
+      return false;
+    }
+    return true;
+  }
+
+  // ---- GET /analytics/whoami ---------------------------------------------
+  // Lets the dashboard label its scope ("All merchants" vs the shop) and
+  // gives operators a cheap credential smoke test.
+  router.get('/whoami', (req, res) => {
+    res.json({
+      role: req.aopAuth.role,
+      merchant_id: req.aopAuth.merchantId,
+      shop_domain: req.aopAuth.shopDomain,
+    });
   });
 
   // ---- GET /analytics/summary --------------------------------------------
   router.get('/summary', async (req, res, next) => {
     try {
       const windowDays = parseWindowDays(req.query.days);
+      const merchantId = req.aopAuth.merchantId;
       const [summary, phases] = await Promise.all([
-        getAnalyticsSummary(db, { windowDays }),
-        getLossPhaseBreakdown(db, { windowDays }),
+        getAnalyticsSummary(db, { windowDays, merchantId }),
+        getLossPhaseBreakdown(db, { windowDays, merchantId }),
       ]);
 
       // Agent Conversion Rate: reconciled orders per intent impression —
@@ -124,7 +202,7 @@ export function buildAnalyticsRouter({ config, db, logger }) {
   router.get('/loss-reasons', async (req, res, next) => {
     try {
       const windowDays = parseWindowDays(req.query.days);
-      const reasons = await getLossReasonBreakdown(db, { windowDays });
+      const reasons = await getLossReasonBreakdown(db, { windowDays, merchantId: req.aopAuth.merchantId });
       const totalCount = reasons.reduce((sum, r) => sum + r.count, 0);
       res.json({
         window_days: windowDays,
@@ -143,7 +221,7 @@ export function buildAnalyticsRouter({ config, db, logger }) {
   router.get('/traffic', async (req, res, next) => {
     try {
       const windowDays = parseWindowDays(req.query.days);
-      const breakdown = await getTrafficBreakdown(db, { windowDays });
+      const breakdown = await getTrafficBreakdown(db, { windowDays, merchantId: req.aopAuth.merchantId });
       const protocolTotal = breakdown.protocols.reduce((sum, p) => sum + p.count, 0);
       const intentTotal = breakdown.intent_categories.reduce((sum, c) => sum + c.count, 0);
       res.json({
@@ -164,7 +242,10 @@ export function buildAnalyticsRouter({ config, db, logger }) {
   router.get('/billing', async (req, res, next) => {
     try {
       const { label, startDate } = parseBillingMonth(req.query.month);
-      const lines = await getBillingStatement(db, { monthStartDate: startDate });
+      const lines = await getBillingStatement(db, {
+        monthStartDate: startDate,
+        merchantId: req.aopAuth.merchantId,
+      });
       // Totals in integer cents — never float-sum decimal strings — and PER
       // CURRENCY: statement lines are (merchant, currency) grains and EUR
       // never sums into USD (migration 0010).
@@ -219,7 +300,7 @@ export function buildAnalyticsRouter({ config, db, logger }) {
   router.get('/benchmark', async (req, res, next) => {
     try {
       const windowDays = parseWindowDays(req.query.days);
-      const benchmark = await getPriceBenchmark(db, { windowDays });
+      const benchmark = await getPriceBenchmark(db, { windowDays, merchantId: req.aopAuth.merchantId });
       // Cents -> decimal strings at the edge of the API (money never floats).
       const money = (c) => (c === null ? null : `${Math.floor(c / 100)}.${String(Math.round(c) % 100).padStart(2, '0')}`);
       res.json({
@@ -247,16 +328,128 @@ export function buildAnalyticsRouter({ config, db, logger }) {
   router.get('/activity', async (req, res, next) => {
     try {
       const limit = parseLimit(req.query.limit);
-      const events = await getRecentActivity(db, { limit });
+      const events = await getRecentActivity(db, { limit, merchantId: req.aopAuth.merchantId });
       res.json({ limit, events });
     } catch (err) {
       next(err);
     }
   });
 
+  // ---- Key management (platform only) ------------------------------------
+
+  // POST /analytics/keys {merchant_id | shop_domain, label?} -> mint a key.
+  // The plaintext appears in THIS response and nowhere else — not in logs,
+  // not in the database (lib/api-keys.js stores digest + display prefix).
+  router.post('/keys', async (req, res, next) => {
+    if (!platformOnly(req, res)) return;
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+
+      // Resolve the target merchant from exactly one of the two selectors.
+      let merchantId = null;
+      if (typeof body.merchant_id === 'string' && UUID_SHAPE.test(body.merchant_id.trim())) {
+        merchantId = body.merchant_id.trim().toLowerCase();
+      } else if (typeof body.shop_domain === 'string' && body.shop_domain.trim() !== '') {
+        const merchant = await findMerchantByShopDomain(db, body.shop_domain.trim());
+        merchantId = merchant?.id ?? null;
+      } else {
+        res.status(400).json({ error: 'merchant_id (uuid) or shop_domain is required' });
+        return;
+      }
+      if (merchantId === null) {
+        res.status(404).json({ error: 'merchant not found' });
+        return;
+      }
+
+      const label =
+        typeof body.label === 'string' && body.label.trim() !== '' ? body.label.trim().slice(0, 120) : null;
+
+      const minted = generateApiKey();
+      let stored;
+      try {
+        stored = await insertMerchantApiKey(db, {
+          merchantId,
+          keyHash: minted.keyHash,
+          keyPrefix: minted.keyPrefix,
+          label,
+        });
+      } catch (err) {
+        // FK violation: merchant_id shaped fine but doesn't exist (or was
+        // deleted mid-flight). A clean 404 beats an opaque 500.
+        if (err?.code === '23503') {
+          res.status(404).json({ error: 'merchant not found' });
+          return;
+        }
+        throw err;
+      }
+
+      logger.info('merchant api key minted', {
+        key_id: stored.id,
+        merchant_id: merchantId,
+        key_prefix: stored.key_prefix, // display prefix only — NEVER the key
+      });
+      res.status(201).json({
+        id: stored.id,
+        merchant_id: merchantId,
+        key_prefix: stored.key_prefix,
+        label,
+        created_at: stored.created_at,
+        // Shown exactly once; the caller must store it now.
+        api_key: minted.plaintext,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // GET /analytics/keys[?merchant_id=uuid] -> inventory (no hashes).
+  router.get('/keys', async (req, res, next) => {
+    if (!platformOnly(req, res)) return;
+    try {
+      let merchantId = null;
+      if (req.query.merchant_id !== undefined) {
+        const raw = String(req.query.merchant_id).trim();
+        if (!UUID_SHAPE.test(raw)) {
+          res.status(400).json({ error: 'merchant_id must be a uuid' });
+          return;
+        }
+        merchantId = raw.toLowerCase();
+      }
+      const keys = await listMerchantApiKeys(db, { merchantId });
+      res.json({ keys });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // DELETE /analytics/keys/:id -> revoke. Idempotent: revoking twice is 200.
+  router.delete('/keys/:id', async (req, res, next) => {
+    if (!platformOnly(req, res)) return;
+    try {
+      const keyId = String(req.params.id ?? '').trim();
+      if (!UUID_SHAPE.test(keyId)) {
+        res.status(404).json({ error: 'key not found' });
+        return;
+      }
+      const outcome = await revokeMerchantApiKey(db, keyId.toLowerCase());
+      if (outcome === 'not_found') {
+        res.status(404).json({ error: 'key not found' });
+        return;
+      }
+      res.json({ id: keyId.toLowerCase(), status: outcome });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // Log analytics failures with route context; the central handler answers.
+  // Param-decode URIErrors (malformed percent-encoding in /keys/:id) are a
+  // client typo the central handler maps to 400 — not a query failure, so
+  // don't page error-level for them.
   router.use((err, req, res, next) => {
-    logger.error('analytics query failed', { err, path: req.path });
+    if (!(err instanceof URIError)) {
+      logger.error('analytics query failed', { err, path: req.path });
+    }
     next(err);
   });
 

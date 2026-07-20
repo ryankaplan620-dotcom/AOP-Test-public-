@@ -159,6 +159,14 @@ export function buildApp({ config, db, logger }) {
       res.status(400).json({ error: 'malformed request body' });
       return;
     }
+    // Express decodes req.params during route matching; a malformed percent
+    // sequence (e.g. DELETE /analytics/keys/%zz) throws URIError with
+    // status=400 BEFORE any handler's own id validation can run. That is a
+    // client typo, not a server fault — answer 400, don't page anyone.
+    if (err instanceof URIError && err.status === 400) {
+      res.status(400).json({ error: 'malformed request path' });
+      return;
+    }
 
     logger.error('unhandled request error', {
       err,
