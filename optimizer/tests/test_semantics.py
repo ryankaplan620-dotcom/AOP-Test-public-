@@ -335,3 +335,64 @@ class NeverRaiseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReviewRegressionFixes(unittest.TestCase):
+    """Adversarially-verified review findings pinned as regressions."""
+
+    def test_threshold_free_shipping_is_conditional(self):
+        for text in (
+            "Free shipping when you spend $50.",
+            "Free shipping on orders $75+.",
+            "Free shipping with a minimum purchase of $60.",
+        ):
+            m = parse_policy_semantics(text)
+            self.assertTrue(m.free_shipping, text)
+            self.assertTrue(m.free_shipping_conditional, text)
+            self.assertIsNotNone(m.free_shipping_threshold, text)
+
+    def test_unconditional_free_shipping_still_wins(self):
+        m = parse_policy_semantics("Free shipping on all orders.")
+        self.assertTrue(m.free_shipping)
+        self.assertFalse(m.free_shipping_conditional)
+
+    def test_offering_store_credit_as_option_is_not_penalized(self):
+        m = parse_policy_semantics(
+            "Returns accepted; you may choose a refund or opt for store credit."
+        )
+        self.assertNotIn("store_credit_only", [p.code for p in m.hidden_penalties])
+        m = parse_policy_semantics("All returns are for store credit only.")
+        self.assertIn("store_credit_only", [p.code for p in m.hidden_penalties])
+
+    def test_negated_restocking_fee_is_a_promise_not_a_penalty(self):
+        for text in (
+            "No restocking fees.",
+            "We never charge restocking fees.",
+            "Returns without any restocking fee.",
+        ):
+            m = parse_policy_semantics(text)
+            self.assertNotIn("restocking_fee", [p.code for p in m.hidden_penalties], text)
+        m = parse_policy_semantics("We charge a 15% restocking fee.")
+        self.assertIn("restocking_fee", [p.code for p in m.hidden_penalties])
+
+    def test_spend_qualifiers_stay_conditional(self):
+        for text in (
+            "Free shipping when you spend over $50.",
+            "Free shipping if you spend at least $50.",
+            "Spend over $75 to unlock free shipping.",
+        ):
+            m = parse_policy_semantics(text)
+            self.assertTrue(m.free_shipping_conditional, text)
+
+    def test_returns_verb_store_credit_is_penalized_but_opt_in_is_not(self):
+        for text in (
+            "Items may be returned for store credit within 30 days.",
+            "Returns are accepted within 30 days for store credit.",
+            "All returns are exchanged for store credit.",
+        ):
+            m = parse_policy_semantics(text)
+            self.assertIn("store_credit_only", [p.code for p in m.hidden_penalties], text)
+        m = parse_policy_semantics(
+            "Returns accepted; you may choose a refund or opt for store credit."
+        )
+        self.assertNotIn("store_credit_only", [p.code for p in m.hidden_penalties])

@@ -180,6 +180,17 @@ const DYNAMIC_NEGATIVE_TTL_MS = 30_000;
  * controlled-502 path, never hang an agent request. */
 const RESOLVE_TIMEOUT_MS = 1_500;
 
+/**
+ * Hard cap on cached hostnames. Without it, a scanner spraying unique Host
+ * headers (with no PROXY_HOSTNAME_SUFFIX configured) grows the negative
+ * cache without bound and can exhaust the isolate's memory — failing LIVE
+ * merchant traffic. FIFO eviction (Map preserves insertion order): losing a
+ * cache entry costs one re-lookup, never correctness. 2000 entries is far
+ * beyond any real merchant fleet on one isolate while bounding worst-case
+ * memory to a few hundred KB.
+ */
+const DYNAMIC_CACHE_MAX_ENTRIES = 2_000;
+
 /** hostname -> {origin: string|null, expiresAt: number} */
 let dynamicCache = new Map();
 /** hostname -> Promise<string|null> for in-flight dedup. */
@@ -243,6 +254,10 @@ export async function resolveOriginDynamic(hostname, env) {
         // negative TTL below keeps outages from hammering the control plane.
       } catch {
         origin = null; // network/timeout — controlled 502 downstream
+      }
+      if (dynamicCache.size >= DYNAMIC_CACHE_MAX_ENTRIES && !dynamicCache.has(host)) {
+        const oldest = dynamicCache.keys().next().value;
+        if (oldest !== undefined) dynamicCache.delete(oldest);
       }
       dynamicCache.set(host, {
         origin,

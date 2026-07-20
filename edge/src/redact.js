@@ -79,6 +79,15 @@ const PII_KEYS = new Set([
   'streetaddress',
   'line1',
   'line2',
+  // Canonical street-line field names of the two supported protocols —
+  // ACP checkout sessions use line_one/line_two, AP2 (W3C PaymentRequest
+  // ContactAddress) uses address_line / addressLine (an ARRAY of lines;
+  // key-redaction replaces the whole array). normalizeKey folds the
+  // underscore variants onto these.
+  'lineone',
+  'linetwo',
+  'addressline',
+  'addresslines',
   'city',
   'company',
   'organization',
@@ -139,11 +148,20 @@ function scrubString(value) {
   return { value: scrubbed, hits };
 }
 
+/**
+ * Plausible postal/region token: short alphanumeric with spaces/dashes and a
+ * bounded digit count (covers US 90210 / 90210-1234, CA "M5V 3A8", UK
+ * "SW1A 1AA", EU numerics). Accepted verbatim under allowlisted geo keys
+ * BEFORE the value scrubber runs — a ZIP+4 must not be eaten as a "phone".
+ * Digit bound (<=9) keeps actual phone numbers out of the fast path.
+ */
+const GEO_VALUE_SHAPE = /^(?=(?:[^0-9]*[0-9]){0,9}[^0-9]*$)[A-Za-z0-9][A-Za-z0-9 -]{0,11}$/;
+
 /** Recursion depth cap — JSON.parse output is acyclic but agents control its
  * shape; a 64-level bound makes pathological nesting a non-issue. */
 const MAX_DEPTH = 64;
 
-function redactValue(value, depth, counter) {
+function redactValue(value, depth, counter, insideAddress = false) {
   if (depth > MAX_DEPTH) return null; // drop absurdly deep subtrees outright
 
   if (typeof value === 'string') {
@@ -152,27 +170,69 @@ function redactValue(value, depth, counter) {
     return scrubbed;
   }
   if (Array.isArray(value)) {
-    return value.map((entry) => redactValue(entry, depth + 1, counter));
+    return value.map((entry) => redactValue(entry, depth + 1, counter, insideAddress));
   }
   if (value && typeof value === 'object') {
     const out = {};
     for (const [key, entry] of Object.entries(value)) {
       const normalized = normalizeKey(key);
       if (GEO_ALLOWLIST.has(normalized)) {
-        // Coarse geo is the one thing we are allowed to keep verbatim (when
-        // it is a scalar — a nested object under "state" still gets walked).
-        out[key] =
-          typeof entry === 'object' && entry !== null
-            ? redactValue(entry, depth + 1, counter)
-            : entry;
+        // Coarse geo is the one thing we are allowed to keep — but only when
+        // the VALUE actually looks like a geo token. An allowlisted key must
+        // not become a smuggling channel ("state": "john@x.com 555-0100").
+        // Order matters: postal-code SHAPES are accepted FIRST ("90210-1234"
+        // would otherwise trip the phone scrubber), then anything the value
+        // scrubber flags (or an implausibly long value) is redacted.
+        if (typeof entry === 'string') {
+          if (GEO_VALUE_SHAPE.test(entry)) {
+            out[key] = entry;
+          } else {
+            const { hits } = scrubString(entry);
+            if (hits > 0 || entry.length > 64) {
+              counter.hits += 1;
+              out[key] = REDACTED;
+            } else {
+              out[key] = entry;
+            }
+          }
+        } else if (typeof entry === 'object' && entry !== null) {
+          out[key] = redactValue(entry, depth + 1, counter, insideAddress);
+        } else {
+          out[key] = entry;
+        }
         continue;
       }
       if (PII_KEYS.has(normalized)) {
+        // "address" is a CONTAINER in ACP/AP2 payloads: its children carry
+        // both street lines (PII) and the geo fields the memo allows
+        // (zip/state/country). It is walked in ALLOWLIST-ONLY mode (the
+        // insideAddress flag): inside an address, every child that is not on
+        // the geo allowlist is redacted regardless of its key name — an
+        // unanticipated field under an address (dependentLocality, district,
+        // organization, any protocol-specific street key) is location PII by
+        // context and must never rely on key/value pattern recognition.
+        if (normalized === 'address' && entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
+          out[key] = redactValue(entry, depth + 1, counter, true);
+          continue;
+        }
         counter.hits += 1;
         out[key] = REDACTED;
         continue;
       }
-      out[key] = redactValue(entry, depth + 1, counter);
+      if (insideAddress) {
+        // Allowlist-only zone: reaching here means the key is neither geo-
+        // allowlisted nor a known PII key — inside an address container that
+        // still means "location data we did not anticipate". Redact scalars;
+        // keep walking containers in the same mode.
+        if (entry !== null && typeof entry === 'object') {
+          out[key] = redactValue(entry, depth + 1, counter, true);
+        } else {
+          counter.hits += 1;
+          out[key] = REDACTED;
+        }
+        continue;
+      }
+      out[key] = redactValue(entry, depth + 1, counter, insideAddress);
     }
     return out;
   }
@@ -200,6 +260,68 @@ export function redactPii(payload) {
     return { payload: redacted, redactions: counter.hits };
   } catch {
     return { payload: null, redactions: -1 };
+  }
+}
+
+/**
+ * Redact PII from a URL query string ("?a=b&c=d", as URL.search returns it).
+ *
+ * The body snapshot goes through redactPii, but agents also put PII in
+ * QUERY PARAMETERS (GET /shipping_quote?email=...&address1=...), and the
+ * query was previously recorded verbatim — a straight bypass of the
+ * compliance layer. Same two passes as the body: PII-named keys drop their
+ * value, surviving values get the string scrub. Geo-allowlisted keys keep
+ * plausible geo values (same smuggling guard as objects).
+ *
+ * @param {string|null|undefined} search  URL.search ('' when absent).
+ * @returns {{query: string, redactions: number}} re-serialized query
+ *   (leading '?' preserved when non-empty). On ANY failure returns
+ *   {query: '', redactions: -1} — dropping the query is the fail-safe.
+ */
+export function redactQueryString(search) {
+  try {
+    if (typeof search !== 'string' || search === '' || search === '?') {
+      return { query: '', redactions: 0 };
+    }
+    const params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
+    let redactions = 0;
+    const out = new URLSearchParams();
+    for (const [key, value] of params) {
+      // PHP/Rails-style nested params name the real field in the LAST
+      // bracket or dot segment (shipping[address1], customer.email) — the
+      // full key would normalize to "shippingaddress1" and miss the PII
+      // list. Check the leaf segment as well as the whole key.
+      const bracketLeaf = /\[([^\]]*)\]\s*$/.exec(key)?.[1];
+      const dotLeaf = key.includes('.') ? key.split('.').pop() : null;
+      const leaf = normalizeKey(bracketLeaf ?? dotLeaf ?? key);
+      const normalized = normalizeKey(key);
+      if (PII_KEYS.has(normalized) || PII_KEYS.has(leaf)) {
+        redactions += 1;
+        out.append(key, REDACTED);
+        continue;
+      }
+      if (GEO_ALLOWLIST.has(normalized) || GEO_ALLOWLIST.has(leaf)) {
+        if (GEO_VALUE_SHAPE.test(value)) {
+          out.append(key, value);
+          continue;
+        }
+        const { hits } = scrubString(value);
+        if (hits > 0 || value.length > 64) {
+          redactions += 1;
+          out.append(key, REDACTED);
+        } else {
+          out.append(key, value);
+        }
+        continue;
+      }
+      const { value: scrubbed, hits } = scrubString(value);
+      redactions += hits;
+      out.append(key, scrubbed);
+    }
+    const serialized = out.toString();
+    return { query: serialized === '' ? '' : `?${serialized}`, redactions };
+  } catch {
+    return { query: '', redactions: -1 };
   }
 }
 

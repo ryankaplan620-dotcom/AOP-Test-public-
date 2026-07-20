@@ -14,18 +14,31 @@
  * Unparseable input renders as "—" (an analytics dashboard must degrade
  * visibly, never crash a render or show NaN).
  *
+ * Optional currency: an ISO-4217 code renders with that currency's symbol;
+ * anything else (e.g. the billing API's 'UNSPECIFIED' for pre-currency rows,
+ * or a code Intl rejects) renders as a plain grouped number — visibly
+ * unlabeled beats a wrong "$".
+ *
  * @param {string|number|null|undefined} value
+ * @param {string} [currency]
  * @returns {string}
  */
-export function formatMoney(value) {
+export function formatMoney(value, currency = 'USD') {
   const num = Number(value);
   if (value === null || value === undefined || value === '' || !Number.isFinite(num)) return '—';
-  return num.toLocaleString('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
+  const plain = () =>
+    num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (typeof currency !== 'string' || !/^[A-Za-z]{3}$/.test(currency)) return plain();
+  try {
+    return num.toLocaleString('en-US', {
+      style: 'currency',
+      currency: currency.toUpperCase(),
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+  } catch {
+    return plain();
+  }
 }
 
 /**

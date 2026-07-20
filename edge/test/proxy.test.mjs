@@ -316,11 +316,11 @@ it('returns a 502 JSON error when no origin can be resolved, without calling fet
   assert.equal(typeof body.message, 'string');
   assert.equal(calls.length, 0, 'must not dispatch to any origin (and must not loop to self)');
 
-  // Intent attempt is still recorded (shop_domain unknown, status 502).
+  // NO telemetry for unroutable traffic: a shop_domain-less record is
+  // rejected by the ingestion validator by contract, so queueing it would
+  // only burn a queue message per scanner hit (review finding).
   await flush(ctx);
-  assert.equal(sends.length, 1);
-  assert.equal(sends[0].status, 502);
-  assert.equal(sends[0].shop_domain, null);
+  assert.equal(sends.length, 0, 'unroutable requests must not queue telemetry');
 });
 
 it('a "//"-prefixed inbound path cannot override the origin host (SSRF regression)', async () => {
@@ -677,4 +677,33 @@ it('static MERCHANT_ROUTES still wins without any dynamic lookup', async () => {
   );
   assert.equal(response.status, 200);
   assert.equal(counts.resolve, 0, 'static hit must stay on the synchronous path');
+});
+
+it('rewrites origin-host redirect Locations onto the proxy hostname (review regression)', async () => {
+  // Shopify origins routinely 301 (canonicalization). Passing the origin-host
+  // Location through would eject the agent from the proxy permanently —
+  // attribution for the session ends. Foreign-host redirects pass untouched.
+  const { binding } = makeQueueSpy();
+  const env = makeEnv(binding);
+  const ctx = makeCtx();
+  installMockOrigin(
+    () =>
+      new Response(null, {
+        status: 301,
+        headers: { Location: 'https://redthreadapparel.com/availability/' },
+      })
+  );
+  const request = new Request('https://agents.redthread.aop.network/availability?sku=A');
+  const response = await worker.fetch(request, env, ctx);
+  assert.equal(response.status, 301);
+  const location = new URL(response.headers.get('Location'));
+  assert.equal(location.hostname, 'agents.redthread.aop.network', 'redirect stays on the proxy');
+  assert.equal(location.pathname, '/availability/');
+
+  // Foreign-host redirect (off-site payment) is NOT rewritten.
+  installMockOrigin(
+    () => new Response(null, { status: 302, headers: { Location: 'https://pay.example.com/x' } })
+  );
+  const response2 = await worker.fetch(request, env, makeCtx());
+  assert.equal(new URL(response2.headers.get('Location')).hostname, 'pay.example.com');
 });

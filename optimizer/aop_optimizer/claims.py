@@ -26,6 +26,7 @@ fraud — compliance memo).
 Stdlib only. Pure: no I/O; never raises on arbitrary input.
 """
 
+import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +42,7 @@ CERTIFICATIONS = {
     "energy star": "ENERGY STAR",
     "b corp": "Certified B Corporation",
     "b-corp": "Certified B Corporation",
+    "b corporation": "Certified B Corporation",
     "bluesign": "bluesign",
     "cradle to cradle": "Cradle to Cradle Certified",
     "usda organic": "USDA Organic",
@@ -50,11 +52,26 @@ CERTIFICATIONS = {
 }
 
 #: Dimension/weight units the precision detector accepts.
-_LENGTH_UNITS = r"(?:mm|cm|m|in(?:ch(?:es)?)?|\"|ft|feet)"
+# NOTE: bare "in" is NOT a unit here — "2 in 1 design" would fabricate a
+# PRECISE_DIMENSIONS claim. Inches must be written in., inch, inches or ".
+_LENGTH_UNITS = r"(?:mm|cm|m|in\.|inch(?:es)?|\"|ft|feet)"
 _WEIGHT_UNITS = r"(?:mg|g|kg|oz|lbs?|pounds?|grams?|kilograms?|ounces?)"
 
 #: value + unit, e.g. "42 cm", '17.5"', "1.2 kg".
-_DIMENSION_RE = re.compile(rf"(\d+(?:\.\d+)?)\s*({_LENGTH_UNITS})\b", re.IGNORECASE)
+# Trailing guard (?![A-Za-z0-9\u00b2\u00b3]) kills area/volume tokens: "100 m2",
+# "5 cm2", "2 m\u00b2" are NOT linear dimensions and must never be published as
+# schema.org width/height. (A bare digit after the unit means the unit was
+# part of a compound like m2.)
+_DIMENSION_RE = re.compile(rf"(\d+(?:\.\d+)?)\s*({_LENGTH_UNITS})(?![A-Za-z0-9\u00b2\u00b3])", re.IGNORECASE)
+
+# In the EXPLICIT dimensions field ({"width": "17.5 in"}) bare "in" is
+# unambiguous — the field name already says it is a linear measurement — so
+# a widened unit set applies there (prose keeps the strict set: "2 in 1"
+# must not fabricate).
+_EXPLICIT_LENGTH_UNITS = r"(?:mm|cm|m|in|inch(?:es)?|\"|ft|feet)"
+_DIMENSION_EXPLICIT_RE = re.compile(
+    rf"(\d+(?:\.\d+)?)\s*({_EXPLICIT_LENGTH_UNITS})(?![A-Za-z0-9\u00b2\u00b3])", re.IGNORECASE
+)
 _WEIGHT_RE = re.compile(rf"(\d+(?:\.\d+)?)\s*({_WEIGHT_UNITS})\b", re.IGNORECASE)
 
 #: Durability signals: an explicit warranty period or a structured score.
@@ -104,14 +121,21 @@ def _text_blob(product: Any) -> str:
 
 
 def _find_certifications(product: Any) -> List[str]:
-    """Certifications from an explicit field first, then prose mentions."""
+    """Certifications from an explicit field first, then prose mentions.
+
+    Matching is BOUNDARY-ANCHORED, never bare substring: "gots" must not
+    match inside "ingots", "rws" inside "forwards" — a fabricated
+    certification injected into published JSON-LD is the one failure mode
+    this module can never afford (it would be a false claim to buyers).
+    """
     found: List[str] = []
     explicit = _get(product, "certifications", "certification")
     entries = explicit if isinstance(explicit, list) else ([explicit] if isinstance(explicit, str) else [])
     haystacks = [str(e) for e in entries[:25]] + [_text_blob(product)]
     lowered = " | ".join(haystacks).lower()
     for needle, canonical in CERTIFICATIONS.items():
-        if needle in lowered and canonical not in found:
+        pattern = r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])"
+        if re.search(pattern, lowered) and canonical not in found:
             found.append(canonical)
     return found
 
@@ -127,11 +151,11 @@ def _find_dimensions(product: Any) -> Tuple[List[Dict[str, Any]], bool]:
     if isinstance(explicit, dict):
         for name in ("width", "height", "depth", "length"):
             raw = explicit.get(name)
-            if isinstance(raw, (int, float)) and raw > 0:
+            if _is_finite_number(raw) and raw > 0:
                 unit = explicit.get("unit") if isinstance(explicit.get("unit"), str) else "cm"
                 dims.append({"name": name, "value": float(raw), "unit": unit})
             elif isinstance(raw, str):
-                match = _DIMENSION_RE.search(raw)
+                match = _DIMENSION_EXPLICIT_RE.search(raw)
                 if match:
                     dims.append({"name": name, "value": float(match.group(1)), "unit": match.group(2).lower()})
     if not dims:
@@ -141,10 +165,17 @@ def _find_dimensions(product: Any) -> Tuple[List[Dict[str, Any]], bool]:
     return dims, len(dims) >= 2
 
 
+def _is_finite_number(value: Any) -> bool:
+    """True only for real, finite numbers. bool is an int subclass (True ==
+    1.0 would fabricate a 1kg weight), and JSON parsers admit 1e999 as inf —
+    which would serialize as the invalid JSON token Infinity in responses."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def _find_weight(product: Any) -> Optional[Dict[str, Any]]:
     explicit = _get(product, "weight")
     unit = _get(product, "weight_unit") or "kg"
-    if isinstance(explicit, (int, float)) and explicit > 0:
+    if _is_finite_number(explicit) and explicit > 0:
         return {"value": float(explicit), "unit": str(unit)}
     if isinstance(explicit, str):
         match = _WEIGHT_RE.search(explicit)
@@ -170,10 +201,10 @@ def _find_materials(product: Any) -> Optional[str]:
 def _find_durability(product: Any) -> Optional[Dict[str, Any]]:
     """Warranty period (months) or an explicit durability score."""
     score = _get(product, "durability_score")
-    if isinstance(score, (int, float)) and 0 <= score <= 100:
+    if _is_finite_number(score) and 0 <= score <= 100:
         return {"kind": "durability_score", "value": float(score)}
     warranty = _get(product, "warranty", "warranty_months")
-    if isinstance(warranty, (int, float)) and warranty > 0:
+    if _is_finite_number(warranty) and warranty > 0:
         return {"kind": "warranty_months", "value": float(warranty)}
     match = _WARRANTY_RE.search(str(warranty) if isinstance(warranty, str) else _text_blob(product))
     if match:
@@ -192,8 +223,41 @@ def _find_origin(product: Any) -> Optional[str]:
     raw = _get(product, "country_of_origin", "origin_country", "made_in")
     if isinstance(raw, str) and raw.strip():
         return raw.strip()[:100]
-    match = re.search(r"made in ([A-Z][A-Za-z ]{1,40})", _text_blob(product))
-    return match.group(1).strip() if match else None
+    # Lead-in matches any casing ("Made in", "made in"); the CAPTURE stays
+    # capital-anchored (country names are capitalized in prose) and stops
+    # before lowercase continuations — "made in Italy from full-grain..."
+    # captures "Italy", not "Italy from full".
+    match = re.search(
+        r"(?:[Mm]ade|[Mm]anufactured|[Pp]roduced)\s+[Ii]n\s+(?:[Tt]he\s+)?"
+        r"((?:[A-Z]{2,4}|[A-Z][a-z'-]+)(?:\s+(?:of\s+)?(?:[A-Z]{2,4}|[A-Z][a-z'-]+)){0,2})",
+        _text_blob(product),
+    )
+    if match is None:
+        # Retry tolerating lowercase prose ("made in south korea"): capture
+        # up to 3 words, then trim at the first non-country continuation
+        # word so "made in portugal with care" yields "Portugal" while
+        # multi-word countries ("south korea", "new zealand") survive.
+        lower_match = re.search(
+            r"(?:made|manufactured|produced)\s+in\s+(?:the\s+)?"
+            r"([a-z][a-z'.-]{1,30}(?:\s+[a-z][a-z'.-]{1,30}){0,2})",
+            _text_blob(product),
+            re.IGNORECASE,
+        )
+        if lower_match is None:
+            return None
+        stop_words = {
+            "with", "from", "by", "using", "for", "and", "in", "to", "under",
+            "at", "on", "since", "our", "its", "then", "where", "which",
+        }
+        words = []
+        for word in lower_match.group(1).split():
+            if word.lower() in stop_words:
+                break
+            words.append(word)
+        if not words:
+            return None
+        return " ".join(w.title() for w in words)
+    return match.group(1).strip()
 
 
 def audit_product_claims(product: Any) -> List[Dict[str, Any]]:
@@ -291,14 +355,14 @@ def build_claims_payload(product: Any) -> Dict[str, Any]:
         jsonld["material"] = by_claim["MATERIALS"]["detected"]
 
     if by_claim["CERTIFICATIONS"]["status"] == "present":
-        jsonld["certification"] = [
+        jsonld["hasCertification"] = [
             {"@type": "Certification", "name": cert} for cert in by_claim["CERTIFICATIONS"]["detected"]
         ]
 
     if by_claim["DURABILITY"]["status"] == "present":
         durability = by_claim["DURABILITY"]["detected"]
         if durability["kind"] == "warranty_months":
-            jsonld["hasWarrantyPromise"] = {
+            jsonld["warranty"] = {
                 "@type": "WarrantyPromise",
                 "durationOfWarranty": {
                     "@type": "QuantitativeValue",

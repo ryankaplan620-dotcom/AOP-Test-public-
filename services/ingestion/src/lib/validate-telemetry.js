@@ -61,9 +61,43 @@ const ANONYMOUS_TOKEN = 'headless_anonymous';
 const UNKNOWN_PROTOCOL = 'UNKNOWN_PROTOCOL';
 const UNSPECIFIED_SKU = 'UNSPECIFIED';
 
+/** UUID shape for the edge-minted idempotency id (db migration 0009). */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /** True for a plain object ({} — not array, not null). */
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Strip U+0000 from every string in a JSON tree (keys and values).
+ *
+ * PostgreSQL's jsonb rejects the \\u0000 escape outright (22P05), and one
+ * such value in one record would abort the whole multi-row batch INSERT — a
+ * single hostile agent payload poisoning up to 499 innocent records,
+ * retried by the queue consumer until the batch dead-letters. NUL carries
+ * no analytic meaning; removal (not rejection) keeps the record while
+ * making it storable. Depth-bounded and cycle-safe by construction
+ * (JSON.parse output only).
+ */
+function stripNulCharacters(value, depth = 0) {
+  if (typeof value === 'string') {
+    return value.includes('\u0000') ? value.split('\u0000').join('') : value;
+  }
+  if (value === null || typeof value !== 'object') return value;
+  // FAIL CLOSED at the depth cap: returning the raw subtree would pass
+  // un-scrubbed NULs straight through to the batch INSERT -- the exact
+  // poisoning this function exists to stop. Dropping an absurdly deep
+  // subtree loses nothing legitimate. Cap 128 comfortably exceeds the edge
+  // redactor's own 64-level bound, so no edge-preserved payload can ever
+  // reach this branch.
+  if (depth > 128) return null;
+  if (Array.isArray(value)) return value.map((entry) => stripNulCharacters(entry, depth + 1));
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) {
+    out[stripNulCharacters(key, depth + 1)] = stripNulCharacters(entry, depth + 1);
+  }
+  return out;
 }
 
 /** Trimmed string or null. */
@@ -135,6 +169,7 @@ function buildEdgeMeta(record) {
  * @returns {{ok: true, value: {
  *     token: string, protocol: string, method: string, path: string,
  *     targetSku: string, shopDomain: string, payload: object|null,
+ *     eventId: string|null,
  *   }} | {ok: false, error: string}}  Never throws.
  */
 export function validateTelemetryRecord(record) {
@@ -142,6 +177,18 @@ export function validateTelemetryRecord(record) {
     if (!isPlainObject(record)) {
       return { ok: false, error: 'record must be a JSON object' };
     }
+
+    // NUL scrub FIRST: PostgreSQL rejects U+0000 in both text columns and
+    // jsonb, and one poisoned string would abort the entire multi-row batch
+    // INSERT downstream. Every later check operates on the scrubbed tree.
+    record = stripNulCharacters(record);
+
+    // --- event id (ingest idempotency key, db migration 0009) -----------
+    // Optional: pre-0009 edge builds don't send one, and a malformed value
+    // degrades to null (record still ingests — it just loses redelivery
+    // dedup) rather than rejecting telemetry the edge already shipped.
+    const eventIdRaw = asTrimmedString(record.event_id);
+    const eventId = eventIdRaw !== null && UUID_PATTERN.test(eventIdRaw) ? eventIdRaw.toLowerCase() : null;
 
     // --- transaction token (attribution key) ----------------------------
     // Missing/blank degrades to the anonymous sentinel (matches the edge's
@@ -226,7 +273,7 @@ export function validateTelemetryRecord(record) {
 
     return {
       ok: true,
-      value: { token, protocol, method, path, targetSku, shopDomain, payload },
+      value: { token, protocol, method, path, targetSku, shopDomain, payload, eventId },
     };
   } catch {
     // Hostile getters etc. — contract: never throws.

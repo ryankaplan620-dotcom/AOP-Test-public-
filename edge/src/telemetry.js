@@ -26,7 +26,7 @@
  * EU infrastructure (data-residency memo).
  */
 
-import { redactPii, dataResidencyRegion } from './redact.js';
+import { redactPii, redactQueryString, dataResidencyRegion } from './redact.js';
 
 /**
  * Upper bound for the request-body snapshot captured into telemetry.
@@ -237,6 +237,18 @@ export async function buildTelemetryRecord(clonedRequest, url, meta = {}) {
   // Start from a fully-populated skeleton so every downstream consumer can rely
   // on the shape even when parsing fails half-way through.
   const record = {
+    // Idempotency id, minted ONCE here — i.e. before queue.send — so a
+    // Cloudflare Queues redelivery carries the SAME id and the ingestion
+    // service's partial unique index (db migration 0009) turns re-insertion
+    // into a no-op instead of double-counting the intent. null if the
+    // runtime lacks randomUUID (ingest treats null as "no dedup possible").
+    event_id: (() => {
+      try {
+        return typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : null;
+      } catch {
+        return null;
+      }
+    })(),
     token:
       typeof safeMeta.token === 'string' && safeMeta.token !== ''
         ? safeMeta.token
@@ -288,7 +300,17 @@ export async function buildTelemetryRecord(clonedRequest, url, meta = {}) {
     const parsedUrl = toUrl(url) ?? toUrl(clonedRequest?.url);
     if (parsedUrl) {
       record.path = parsedUrl.pathname;
-      record.query = parsedUrl.search; // includes leading '?', '' when absent
+      // Query params get the SAME compliance treatment as the body — agents
+      // put PII in GET query strings (?email=..., ?address1=...) and a
+      // verbatim copy would bypass redactPii entirely. The redaction count
+      // folds into the record's audit counter below.
+      const { query, redactions: queryRedactions } = redactQueryString(parsedUrl.search);
+      record.query = query;
+      if (queryRedactions === -1) {
+        record.pii_redactions = -1; // fail-safe path: query was dropped
+      } else {
+        record.pii_redactions += queryRedactions;
+      }
     }
 
     // Body snapshot: bounded read from the clone, then best-effort JSON parse.
@@ -310,7 +332,10 @@ export async function buildTelemetryRecord(clonedRequest, url, meta = {}) {
     record.target_sku = extractTargetSku(parsedUrl, parsedPayload);
     const { payload: redactedPayload, redactions } = redactPii(parsedPayload);
     record.inbound_payload = redactedPayload;
-    record.pii_redactions = redactions;
+    // ACCUMULATE onto the query-redaction count from above (never assign
+    // over it); -1 from either pass is sticky — it marks the fail-safe drop.
+    record.pii_redactions =
+      redactions === -1 || record.pii_redactions === -1 ? -1 : record.pii_redactions + redactions;
   } catch {
     // Absolute backstop: whatever exploded, the partial record still ships.
   }

@@ -97,10 +97,15 @@ export function buildAnalyticsRouter({ config, db, logger }) {
         window_days: windowDays,
         impressions: summary.impressions,
         orders_won: summary.orders_won,
-        gmv: summary.gmv,
-        commission: summary.commission,
+        // MONEY is per-currency only (mirrors the billing contract): each
+        // entry carries gross, credits, and SQL-subtracted net figures.
+        // There are deliberately NO cross-currency scalar money totals.
+        currencies: summary.currencies,
+        adjustments: summary.adjustments,
         conversion_rate_pct: conversionRatePct,
         losses: summary.losses,
+        // Heuristic cents from agent payloads — no currency evidence; render
+        // unlabeled, never with a currency symbol.
         estimated_losses: summary.estimated_losses,
         critical_dropoff: topPhase
           ? {
@@ -160,25 +165,50 @@ export function buildAnalyticsRouter({ config, db, logger }) {
     try {
       const { label, startDate } = parseBillingMonth(req.query.month);
       const lines = await getBillingStatement(db, { monthStartDate: startDate });
-      // Totals in integer cents — never float-sum decimal strings.
+      // Totals in integer cents — never float-sum decimal strings — and PER
+      // CURRENCY: statement lines are (merchant, currency) grains and EUR
+      // never sums into USD (migration 0010).
       const cents = (v) => Math.round(Number(v) * 100);
-      const totals = lines.reduce(
-        (acc, line) => ({
-          orders: acc.orders + line.orders,
-          gmv_cents: acc.gmv_cents + cents(line.gmv),
-          commission_cents: acc.commission_cents + cents(line.commission),
-        }),
-        { orders: 0, gmv_cents: 0, commission_cents: 0 },
-      );
-      const decimal = (c) => `${Math.floor(c / 100)}.${String(c % 100).padStart(2, '0')}`;
+      const byCurrency = new Map();
+      for (const line of lines) {
+        const acc = byCurrency.get(line.currency) ?? {
+          currency: line.currency,
+          orders: 0,
+          gmv_cents: 0,
+          commission_cents: 0,
+          adjustments: 0,
+          adjusted_gmv_cents: 0,
+          commission_credit_cents: 0,
+        };
+        acc.orders += line.orders;
+        acc.gmv_cents += cents(line.gmv);
+        acc.commission_cents += cents(line.commission);
+        acc.adjustments += line.adjustments;
+        acc.adjusted_gmv_cents += cents(line.adjusted_gmv);
+        acc.commission_credit_cents += cents(line.commission_credits);
+        byCurrency.set(line.currency, acc);
+      }
+      // Sign-safe cents -> decimal (net figures can go negative in a month
+      // that credits more than it charges).
+      const decimal = (c) => {
+        const sign = c < 0 ? '-' : '';
+        const abs = Math.abs(c);
+        return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
+      };
       res.json({
         month: label,
         lines,
-        totals: {
-          orders: totals.orders,
-          gmv: decimal(totals.gmv_cents),
-          commission: decimal(totals.commission_cents),
-        },
+        totals: [...byCurrency.values()].map((t) => ({
+          currency: t.currency,
+          orders: t.orders,
+          gmv: decimal(t.gmv_cents),
+          commission: decimal(t.commission_cents),
+          adjustments: t.adjustments,
+          adjusted_gmv: decimal(t.adjusted_gmv_cents),
+          commission_credits: decimal(t.commission_credit_cents),
+          net_gmv: decimal(t.gmv_cents - t.adjusted_gmv_cents),
+          net_commission: decimal(t.commission_cents - t.commission_credit_cents),
+        })),
       });
     } catch (err) {
       next(err);

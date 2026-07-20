@@ -24,7 +24,7 @@
 import express from 'express';
 import { timingSafeTokenCheck } from '../lib/auth.js';
 import { validateTelemetryRecord } from '../lib/validate-telemetry.js';
-import { findMerchantByShopDomain, insertIntentLogsBatch } from '../repositories.js';
+import { findMerchantForTelemetry, insertIntentLogsBatch } from '../repositories.js';
 
 /** Hard ceiling on records per POST — beyond this the caller must split. */
 export const MAX_RECORDS_PER_BATCH = 500;
@@ -84,6 +84,9 @@ export function buildTelemetryRouter({ config, db, logger }) {
 
   /**
    * Resolve shop_domain -> merchant row ({id, ...}) or null, via cache.
+   * Telemetry shop_domain is the edge's RESOLVED ORIGIN hostname, so the
+   * lookup matches either shopify_shop_domain or origin_hostname (custom-
+   * domain merchants; see findMerchantForTelemetry / migration 0011).
    * NEGATIVE results are cached too — otherwise a flood of events for an
    * unknown domain (e.g. a merchant mid-offboarding) would hammer PostgreSQL
    * once per record. Keyed lowercase to match the DB's case-insensitive
@@ -93,7 +96,7 @@ export function buildTelemetryRouter({ config, db, logger }) {
     const key = shopDomain.toLowerCase();
     const cached = merchantCache.get(key);
     if (cached !== null) return cached.value;
-    const merchant = await findMerchantByShopDomain(db, shopDomain);
+    const merchant = await findMerchantForTelemetry(db, shopDomain);
     merchantCache.set(key, merchant);
     return merchant;
   }
@@ -165,6 +168,7 @@ export function buildTelemetryRouter({ config, db, logger }) {
           path: verdict.value.path,
           targetSku: verdict.value.targetSku,
           payload: verdict.value.payload,
+          eventId: verdict.value.eventId,
         });
       }
 

@@ -31,32 +31,68 @@
 /** Rows deleted per inner purge transaction (see purge_expired_telemetry). */
 const PURGE_BATCH_SIZE = 10_000;
 
+/** Advisory-lock key (unique among AOP jobs; see loss-sweep's 815001). */
+export const RETENTION_SWEEP_LOCK_KEY = 815002;
+
 export function startRetentionSweep({ db, config, logger }) {
   let running = false; // overlap guard
   let stopped = false;
   let inFlight = Promise.resolve();
 
-  async function runOnce() {
-    const summary = { intents_deleted: 0, failed: false };
+  // Cross-replica guard (same rationale as loss-sweep): the purge is
+  // idempotent, so the lock removes duplicate ctid-batch scans across
+  // scaled-out replicas rather than preventing corruption.
+  const withLock =
+    typeof db.withAdvisoryLock === 'function'
+      ? (fn) => db.withAdvisoryLock(RETENTION_SWEEP_LOCK_KEY, fn)
+      : async (fn) => ({ ran: true, result: await fn() });
+
+  async function purgePass() {
+    const summary = { intents_deleted: 0, batches: 0, failed: false };
+    // The SQL function deletes ONE ctid-batch per call (migration 0012) and
+    // THIS loop drains the backlog: every iteration is its own statement /
+    // transaction, so no backlog size can ever hit statement_timeout, and
+    // batches already deleted stay deleted if a later one fails. (The 0006
+    // version looped inside one plpgsql call = one 15s-bounded transaction —
+    // any real backlog rolled back wholesale, forever.)
     try {
-      const result = await db.query('SELECT * FROM purge_expired_telemetry($1, $2)', [
-        config.retentionDays,
-        PURGE_BATCH_SIZE,
-      ]);
-      summary.intents_deleted = Number(result.rows[0]?.intents_deleted ?? 0);
+      for (;;) {
+        if (stopped) break; // shutdown: finish mid-backlog gracefully
+        const result = await db.query('SELECT * FROM purge_expired_telemetry($1, $2)', [
+          config.retentionDays,
+          PURGE_BATCH_SIZE,
+        ]);
+        const deleted = Number(result.rows[0]?.intents_deleted ?? 0);
+        summary.intents_deleted += deleted;
+        summary.batches += 1;
+        if (deleted < PURGE_BATCH_SIZE) break; // backlog drained
+      }
       if (summary.intents_deleted > 0) {
         logger.info('retention purge completed', {
           intents_deleted: summary.intents_deleted,
+          batches: summary.batches,
           retention_days: config.retentionDays,
         });
       }
     } catch (err) {
-      // DB down or migration 0006 not applied — log loudly, retry next tick.
+      // DB down or migration not applied — log loudly, retry next tick.
       // The cap is a compliance obligation: silence here would hide drift.
+      // Batches deleted before the failure remain deleted (progress holds).
       summary.failed = true;
       logger.error('retention purge failed; will retry next tick', { err });
     }
     return summary;
+  }
+
+  async function runOnce() {
+    try {
+      const { ran, result } = await withLock(purgePass);
+      if (!ran) return { intents_deleted: 0, failed: false, skipped: true };
+      return result;
+    } catch (err) {
+      logger.error('retention purge could not acquire/release the advisory lock; will retry next tick', { err });
+      return { intents_deleted: 0, failed: true, skipped: true };
+    }
   }
 
   const timer = setInterval(() => {

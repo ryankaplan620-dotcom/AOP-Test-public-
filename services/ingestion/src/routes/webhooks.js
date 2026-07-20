@@ -1,14 +1,17 @@
 /**
- * routes/webhooks.js — the Webhook Receiver Engine (Shopify order-created).
+ * routes/webhooks.js — the Webhook Receiver Engine (Shopify).
  *
- * Role in the AOP data flow:
- *   [Shopify orders/create webhook] --> THIS ROUTE
- *     --> HMAC verify against RAW bytes (src/lib/shopify-hmac.js)
- *     --> extract aop_transaction_token from note_attributes/attributes
- *     --> resolve merchant (X-Shopify-Shop-Domain header)
- *     --> stitch to the latest matching agent_intent_logs row (attribution)
+ * Role in the AOP data flow (three topics, one HMAC gate):
+ *   [orders/create]    --> stitch to agent_intent_logs (attribution)
  *     --> INSERT reconciled_agent_orders (DB computes the 0.5% commission
  *         in its generated column; ON CONFLICT makes redelivery idempotent).
+ *   [refunds/create]   --> INSERT order_adjustments crediting back the
+ *         refunded GMV's commission share (migration 0008 ledger).
+ *   [orders/cancelled] --> INSERT order_adjustments crediting everything
+ *         still creditable on the order.
+ *   The credit paths keep billing honest: a commission charged at
+ *   reconciliation is reversed when the money goes back to the buyer —
+ *   statements net the two ledgers (getBillingStatement).
  *
  * RAW-BODY INVARIANT (load-bearing): this router is mounted in src/app.js
  * BEFORE express.json(), and uses express.raw() itself, because Shopify's
@@ -33,8 +36,18 @@
 
 import express from 'express';
 import { verifyShopifyHmac } from '../lib/shopify-hmac.js';
-import { parseMoneyToCents } from '../lib/commission.js';
-import { findMerchantByShopDomain, findLatestIntentByToken, insertReconciledOrder } from '../repositories.js';
+import { parseMoneyToCents, formatCentsAsDecimal } from '../lib/commission.js';
+import {
+  findMerchantByShopDomain,
+  findLatestIntentByToken,
+  insertReconciledOrder,
+  insertOrderAdjustment,
+  insertAdjustmentOrphan,
+  findAdjustmentOrphansForOrder,
+  deleteAdjustmentOrphan,
+  deleteLossDiagnosticForIntent,
+  findReconciledOrderByShopifyId,
+} from '../repositories.js';
 
 /** The note_attributes/attributes key agents echo the edge token under. */
 export const TOKEN_ATTRIBUTE_NAME = 'aop_transaction_token';
@@ -84,6 +97,177 @@ function extractTransactionToken(order) {
 }
 
 /**
+ * Coerce a Shopify identifier (numeric REST id or GraphQL GID string) to a
+ * bounded string, or null. Only string/number are honored — an object would
+ * stringify to "[object Object]" and poison idempotency keys.
+ *
+ * @param {unknown} value
+ * @param {number} [maxLength]
+ * @returns {string|null}
+ */
+function parseShopifyId(value, maxLength = 100) {
+  let id = null;
+  if (typeof value === 'number' && Number.isFinite(value)) id = String(value);
+  else if (typeof value === 'string' && value.trim() !== '') id = value.trim();
+  return id !== null && id.length <= maxLength ? id : null;
+}
+
+/**
+ * ISO-4217-shaped currency code from a Shopify payload field, or null.
+ * Shape check only (3 ASCII letters, uppercased) — a full currency table
+ * would go stale; the DB CHECK enforces the same shape (migration 0010).
+ */
+function parseCurrency(value) {
+  return typeof value === 'string' && /^[A-Za-z]{3}$/.test(value.trim())
+    ? value.trim().toUpperCase()
+    : null;
+}
+
+/**
+ * The shared webhook gate: HMAC-verify the RAW bytes, parse JSON, resolve the
+ * merchant from X-Shopify-Shop-Domain. Sends the response itself on every
+ * failure path (per the response-code policy in the module header) and
+ * returns null; returns {payload, shopDomain, merchant} when the caller
+ * should proceed with topic-specific logic.
+ */
+async function gateShopifyWebhook(req, res, { config, db, logger }) {
+  // --- authenticity gate (the ONLY 401 path) ------------------------------
+  const hmacHeader = req.get('x-shopify-hmac-sha256');
+  if (!verifyShopifyHmac(req.body, hmacHeader, config.shopifyWebhookSecret)) {
+    logger.warn('shopify webhook rejected: HMAC verification failed', {
+      has_header: typeof hmacHeader === 'string',
+      path: req.path,
+    });
+    res.status(401).json({ error: 'invalid webhook signature' });
+    return null;
+  }
+
+  // --- parse (bytes are now authenticated) --------------------------------
+  let payload;
+  try {
+    payload = JSON.parse(req.body.toString('utf8'));
+  } catch {
+    // Authentic but unparseable — the same bytes will fail the same way on
+    // every retry, so acknowledge and log loudly instead of triggering
+    // Shopify's retry storm.
+    logger.error('shopify webhook body failed JSON parse despite valid HMAC', { path: req.path });
+    res.status(200).json({ ok: true, action: 'ignored_unparseable_body' });
+    return null;
+  }
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    logger.error('shopify webhook payload is not an object; ignoring', { path: req.path });
+    res.status(200).json({ ok: true, action: 'ignored_malformed_payload' });
+    return null;
+  }
+
+  // --- merchant resolution ------------------------------------------------
+  // The shop domain header is trustworthy at this point: it is part of the
+  // signed request context of a webhook whose HMAC verified.
+  const shopDomain = (req.get('x-shopify-shop-domain') ?? '').trim();
+  if (shopDomain === '') {
+    logger.warn('shopify webhook missing X-Shopify-Shop-Domain; cannot attribute', { path: req.path });
+    res.status(200).json({ ok: true, action: 'ignored_missing_shop_domain' });
+    return null;
+  }
+  const merchant = await findMerchantByShopDomain(db, shopDomain);
+  if (merchant === null) {
+    // Not onboarded (or already offboarded). Retrying won't change it on
+    // Shopify's timescale — acknowledge, keep a forensic trail.
+    logger.warn('shopify webhook for unknown merchant; skipping', {
+      shop_domain: shopDomain,
+      path: req.path,
+    });
+    res.status(200).json({ ok: true, action: 'skipped_unknown_merchant' });
+    return null;
+  }
+
+  return { payload, shopDomain, merchant };
+}
+
+/**
+ * Total refunded amount of a refunds/create payload: integer cents plus the
+ * currency the amount is denominated in (null when the payload names none).
+ *
+ * Primary source: refund.transactions — the money actually moved back to the
+ * buyer (kind 'refund'; status defaults to success when absent, and 'failure'
+ * / 'error' rows are excluded so a failed refund attempt never credits).
+ * The transaction currency is captured so the ledger can REFUSE to net a
+ * presentment-currency amount against shop-currency GMV (currency_mismatch)
+ * instead of silently mixing currencies.
+ *
+ * Fallback when no transactions exist: refund_line_items subtotal PLUS
+ * total_tax (the charged GMV is tax-inclusive — crediting tax-exclusive
+ * subtotals would systematically under-credit) plus any order_adjustments
+ * (shipping refunds arrive there, not as line items).
+ *
+ * Returns {cents, currency} — cents null when no parseable amount exists,
+ * 0 for an explicit zero-money refund (restock without payment movement).
+ */
+function refundedAmount(refund) {
+  const transactions = Array.isArray(refund?.transactions) ? refund.transactions : [];
+  let total = 0;
+  let sawTransaction = false;
+  let currency = null;
+  for (const tx of transactions.slice(0, 100)) {
+    if (tx === null || typeof tx !== 'object') continue;
+    if (tx.kind !== 'refund') continue;
+    const status = typeof tx.status === 'string' ? tx.status : 'success';
+    if (status !== 'success') continue;
+    const cents = parseMoneyToCents(tx.amount);
+    if (cents === null) continue;
+    sawTransaction = true;
+    total += cents;
+    if (currency === null) currency = parseCurrency(tx.currency);
+  }
+  if (sawTransaction) return { cents: total, currency };
+
+  let lineTotal = 0;
+  let sawAmount = false;
+  const lineItems = Array.isArray(refund?.refund_line_items) ? refund.refund_line_items : [];
+  for (const line of lineItems.slice(0, 250)) {
+    if (line === null || typeof line !== 'object') continue;
+    const subtotal = parseMoneyToCents(line.subtotal);
+    if (subtotal === null) continue;
+    sawAmount = true;
+    lineTotal += subtotal;
+    // Charged GMV (order.total_price) includes tax; the credit must too.
+    // KNOWN BOUNDED TRADEOFF: on tax-INCLUSIVE (VAT) stores, subtotal may
+    // already contain the tax, making this a slight over-credit for partial
+    // refunds — the refund payload carries no taxes_included flag to
+    // distinguish. Over-credit is merchant-favorable and hard-capped by the
+    // per-order GMV clamp + per-order fee clamp; the alternative
+    // (skipping tax) under-credits every US-style store, which is the
+    // dispute-generating direction. Transactions remain the primary,
+    // exact source — this branch only runs when they are absent.
+    const tax = parseMoneyToCents(line.total_tax);
+    if (tax !== null) lineTotal += tax;
+  }
+  // Shipping refunds live in order_adjustments (amounts are negative in
+  // Shopify's convention; take magnitudes). ONLY kind 'shipping_refund' is
+  // credited: 'refund_discrepancy' entries are SIGNED corrections in either
+  // direction, and abs-summing them would manufacture credit out of a
+  // correction that reduced the refund. Excluding them can only
+  // under-credit (merchant disputes surface; silent over-credit does not).
+  const magnitudeCents = (value) => {
+    if (typeof value === 'number') return parseMoneyToCents(Math.abs(value));
+    if (typeof value === 'string') return parseMoneyToCents(value.replace(/^\s*-/, ''));
+    return null;
+  };
+  const adjustments = Array.isArray(refund?.order_adjustments) ? refund.order_adjustments : [];
+  for (const adj of adjustments.slice(0, 100)) {
+    if (adj === null || typeof adj !== 'object') continue;
+    if (adj.kind !== 'shipping_refund') continue;
+    const amount = magnitudeCents(adj.amount);
+    if (amount === null) continue;
+    sawAmount = true;
+    lineTotal += amount;
+    const tax = magnitudeCents(adj.tax_amount);
+    if (tax !== null) lineTotal += tax;
+  }
+  return { cents: sawAmount ? lineTotal : null, currency: null };
+}
+
+/**
  * Build the webhooks router.
  *
  * @param {{config: object, db: object, logger: object}} deps
@@ -92,82 +276,29 @@ function extractTransactionToken(order) {
 export function buildWebhooksRouter({ config, db, logger }) {
   const router = express.Router();
 
+  // Raw body capture — MUST run before any JSON parser (see header). 1mb
+  // bound: real payloads are tens of KB; anything bigger is not Shopify.
+  // Content-Type-scoped to application/json exactly as Shopify sends it; a
+  // caller with another content type simply gets no parsed body and fails
+  // HMAC in the gate (fail closed).
+  const rawJson = express.raw({ type: 'application/json', limit: '1mb' });
+
   router.post(
     '/shopify/orders-create',
-    // Raw body capture — MUST run before any JSON parser (see header).
-    // 1mb bound: real order payloads are tens of KB; anything bigger is not
-    // a Shopify order. Content-Type-scoped to application/json exactly as
-    // Shopify sends it; a caller with another content type simply gets no
-    // parsed body and fails HMAC below (fail closed).
-    express.raw({ type: 'application/json', limit: '1mb' }),
+    rawJson,
     async (req, res, next) => {
       try {
-        // --- authenticity gate (the ONLY 401 path) ----------------------
-        const hmacHeader = req.get('x-shopify-hmac-sha256');
-        if (!verifyShopifyHmac(req.body, hmacHeader, config.shopifyWebhookSecret)) {
-          logger.warn('shopify webhook rejected: HMAC verification failed', {
-            has_header: typeof hmacHeader === 'string',
-          });
-          res.status(401).json({ error: 'invalid webhook signature' });
-          return;
-        }
-
-        // --- parse (bytes are now authenticated) ------------------------
-        let order;
-        try {
-          order = JSON.parse(req.body.toString('utf8'));
-        } catch {
-          // Authentic but unparseable — the same bytes will fail the same
-          // way on every retry, so acknowledge and log loudly instead of
-          // triggering Shopify's retry storm.
-          logger.error('shopify webhook body failed JSON parse despite valid HMAC');
-          res.status(200).json({ ok: true, action: 'ignored_unparseable_body' });
-          return;
-        }
-        if (order === null || typeof order !== 'object' || Array.isArray(order)) {
-          logger.error('shopify webhook payload is not an object; ignoring');
-          res.status(200).json({ ok: true, action: 'ignored_malformed_payload' });
-          return;
-        }
+        const gate = await gateShopifyWebhook(req, res, { config, db, logger });
+        if (gate === null) return;
+        const { payload: order, shopDomain, merchant } = gate;
 
         // Order identifier: numeric REST id preferred, GraphQL GID fallback.
-        // Only string/number are honored (an object would stringify to
-        // "[object Object]" and poison the idempotency key). Max 100 chars —
-        // the reconciled_agent_orders.shopify_order_id column width.
-        let shopifyOrderId = null;
-        if (typeof order.id === 'number' && Number.isFinite(order.id)) {
-          shopifyOrderId = String(order.id);
-        } else if (typeof order.id === 'string' && order.id.trim() !== '') {
-          shopifyOrderId = order.id.trim();
-        } else if (typeof order.admin_graphql_api_id === 'string' && order.admin_graphql_api_id.trim() !== '') {
-          shopifyOrderId = order.admin_graphql_api_id.trim();
-        }
-        if (shopifyOrderId === null || shopifyOrderId.length > 100) {
+        // Max 100 chars — the shopify_order_id column width.
+        const shopifyOrderId =
+          parseShopifyId(order.id) ?? parseShopifyId(order.admin_graphql_api_id);
+        if (shopifyOrderId === null) {
           logger.error('shopify webhook order missing/invalid id; ignoring');
           res.status(200).json({ ok: true, action: 'ignored_missing_order_id' });
-          return;
-        }
-
-        // --- merchant resolution ----------------------------------------
-        // The shop domain header is trustworthy at this point: it is part of
-        // the signed request context of a webhook whose HMAC verified.
-        const shopDomain = (req.get('x-shopify-shop-domain') ?? '').trim();
-        if (shopDomain === '') {
-          logger.warn('shopify webhook missing X-Shopify-Shop-Domain; cannot attribute', {
-            shopify_order_id: shopifyOrderId,
-          });
-          res.status(200).json({ ok: true, action: 'ignored_missing_shop_domain' });
-          return;
-        }
-        const merchant = await findMerchantByShopDomain(db, shopDomain);
-        if (merchant === null) {
-          // Not onboarded (or already offboarded). Retrying won't change it
-          // on Shopify's timescale — acknowledge, keep a forensic trail.
-          logger.warn('shopify webhook for unknown merchant; skipping', {
-            shop_domain: shopDomain,
-            shopify_order_id: shopifyOrderId,
-          });
-          res.status(200).json({ ok: true, action: 'skipped_unknown_merchant' });
           return;
         }
 
@@ -232,18 +363,52 @@ export function buildWebhooksRouter({ config, db, logger }) {
           shopifyOrderId,
           transactionToken: token,
           gmv: gmvDecimal,
+          // ISO-4217 code from the order payload (migration 0010); null when
+          // Shopify ever omits/mangles it — visibly unknown beats wrong.
+          currency: parseCurrency(order.currency),
         });
 
         if (!inserted) {
           // ON CONFLICT fired: Shopify redelivered a webhook we already
-          // billed. The UNIQUE constraint is the idempotency backstop —
-          // acknowledge so redelivery stops.
+          // billed. The row is the idempotency backstop — but the ORIGINAL
+          // delivery may have crashed between committing the order and
+          // running the post-reconciliation side effects, so run them here
+          // too (both are idempotent: DELETE of nothing + ON CONFLICT
+          // ledger inserts). This is what un-strands parked credits after a
+          // partial failure.
+          const existing = await findReconciledOrderByShopifyId(db, {
+            merchantId: merchant.id,
+            shopifyOrderId,
+          });
+          if (existing?.intent_log_id) {
+            await deleteLossDiagnosticForIntent(db, existing.intent_log_id);
+          }
+          await replayParkedCredits(merchant.id, shopifyOrderId);
           logger.info('shopify order already reconciled (webhook redelivery)', {
             shopify_order_id: shopifyOrderId,
           });
           res.status(200).json({ ok: true, action: 'already_reconciled' });
           return;
         }
+
+        // Reverse a false LOST verdict: an intent that converted AFTER the
+        // expiry window was already swept into loss_diagnostics — leaving it
+        // double-counts the session as both LOST and WON in every aggregate.
+        if (intent !== null) {
+          const { deleted } = await deleteLossDiagnosticForIntent(db, intent.id);
+          if (deleted > 0) {
+            logger.info('late conversion: reversed prior loss diagnostic', {
+              shopify_order_id: shopifyOrderId,
+              intent_log_id: intent.id,
+            });
+          }
+        }
+
+        // Replay credits that arrived BEFORE this order webhook (Shopify
+        // does not order deliveries across topics): each parked orphan runs
+        // through the normal ledger insert — same clamp, same idempotency —
+        // then leaves the parking lot.
+        await replayParkedCredits(merchant.id, shopifyOrderId);
 
         logger.info('order reconciled to agent intent', {
           shop_domain: shopDomain,
@@ -258,6 +423,206 @@ export function buildWebhooksRouter({ config, db, logger }) {
       } catch (err) {
         // Transient faults (DB down, pool timeout): 5xx so Shopify redelivers
         // once we recover — see response-code policy in the header comment.
+        next(err);
+      }
+    }
+  );
+
+  /**
+   * Drain the orphan parking lot for one order through the normal ledger
+   * insert (same clamp, same source_event_id idempotency). Runs on EVERY
+   * path that observes a reconciled order — first delivery, webhook
+   * redelivery, and immediately after parking a credit whose order raced in
+   * — so a parked credit can never be stranded by crash/redelivery/race
+   * interleavings. Idempotent throughout: replaying twice is a no-op.
+   * @returns {Promise<number>} orphans processed.
+   */
+  async function replayParkedCredits(merchantId, shopifyOrderId) {
+    const orphans = await findAdjustmentOrphansForOrder(db, { merchantId, shopifyOrderId });
+    for (const orphan of orphans) {
+      const { status } = await insertOrderAdjustment(db, {
+        merchantId,
+        shopifyOrderId,
+        sourceEventId: orphan.source_event_id,
+        kind: orphan.adjustment_kind,
+        requestedGmv: orphan.requested_gmv,
+        requestedCurrency: orphan.requested_currency ?? null,
+      });
+      await deleteAdjustmentOrphan(db, orphan.id);
+      logger.info('replayed parked credit', {
+        shopify_order_id: shopifyOrderId,
+        source_event_id: orphan.source_event_id,
+        outcome: status,
+      });
+    }
+    return orphans.length;
+  }
+
+  /**
+   * Shared tail for the two credit topics: run the ledger insert and map its
+   * status onto the response-code policy (all business outcomes are 200; the
+   * catch block upstream keeps 5xx for genuinely transient faults).
+   */
+  async function respondWithAdjustment(res, log, adjustment) {
+    const { status, row } = await insertOrderAdjustment(db, adjustment);
+    if (status === 'credited') {
+      logger.info('billing credit recorded', {
+        ...log,
+        adjusted_gmv: row?.adjusted_gmv ?? null,
+        commission_credit: row?.commission_credit ?? null,
+      });
+      res.status(200).json({ ok: true, action: 'credited' });
+      return;
+    }
+    if (status === 'duplicate') {
+      // Webhook redelivery — the UNIQUE(source_event_id) backstop fired.
+      logger.info('billing credit already recorded (webhook redelivery)', log);
+      res.status(200).json({ ok: true, action: 'already_credited' });
+      return;
+    }
+    if (status === 'currency_mismatch') {
+      // Presentment-currency refund against shop-currency GMV: netting the
+      // two would be silent wrong math. Refuse loudly; operator reconciles.
+      logger.error('adjustment refused: refund currency differs from order currency', log);
+      res.status(200).json({ ok: true, action: 'refused_currency_mismatch' });
+      return;
+    }
+    if (status === 'order_not_found') {
+      // Two very different causes share this shape: the order was never
+      // agent-attributed (most orders — nothing billed, nothing to credit),
+      // OR its orders/create webhook simply hasn't arrived yet (Shopify
+      // does not order deliveries across topics). Park the credit; the
+      // reconciliation path replays it if the order ever lands. Orphans for
+      // never-attributed orders just sit harmlessly (cascade-cleaned with
+      // the merchant).
+      const { inserted } = await insertAdjustmentOrphan(db, {
+        merchantId: adjustment.merchantId,
+        shopifyOrderId: adjustment.shopifyOrderId,
+        sourceEventId: adjustment.sourceEventId,
+        kind: adjustment.kind,
+        requestedGmv: adjustment.requestedGmv,
+        requestedCurrency: adjustment.requestedCurrency ?? null,
+      });
+      // TOCTOU closure: the order may have reconciled BETWEEN the ledger's
+      // order_not_found check and the park above (its replay pass would then
+      // have seen an empty lot). Re-check now that the orphan is durably
+      // committed; if the order exists, replay immediately -- one of the two
+      // writers is guaranteed to see the other's committed row.
+      const nowReconciled = await findReconciledOrderByShopifyId(db, {
+        merchantId: adjustment.merchantId,
+        shopifyOrderId: adjustment.shopifyOrderId,
+      });
+      if (nowReconciled !== null) {
+        await replayParkedCredits(adjustment.merchantId, adjustment.shopifyOrderId);
+        logger.info('credit parked then immediately replayed (order raced in)', log);
+        res.status(200).json({ ok: true, action: 'credit_replayed' });
+        return;
+      }
+      logger.info(
+        inserted
+          ? 'credit parked: order not reconciled (yet); will replay if it lands'
+          : 'credit already parked (webhook redelivery)',
+        log
+      );
+      res.status(200).json({ ok: true, action: inserted ? 'credit_parked' : 'already_parked' });
+      return;
+    }
+    // nothing_remaining: the order is already fully credited (e.g. cancelled
+    // after a full refund) — the ledger clamp held the line.
+    logger.info('adjustment skipped: order already fully credited', log);
+    res.status(200).json({ ok: true, action: 'already_fully_credited' });
+  }
+
+  // ---- POST /shopify/refunds-create ---------------------------------------
+  router.post(
+    '/shopify/refunds-create',
+    rawJson,
+    async (req, res, next) => {
+      try {
+        const gate = await gateShopifyWebhook(req, res, { config, db, logger });
+        if (gate === null) return;
+        const { payload: refund, shopDomain, merchant } = gate;
+
+        const refundId = parseShopifyId(refund.id);
+        const orderId =
+          parseShopifyId(refund.order_id) ?? parseShopifyId(refund.admin_graphql_api_id, 100);
+        if (refundId === null || orderId === null) {
+          logger.error('shopify refund webhook missing refund/order id; ignoring', {
+            shop_domain: shopDomain,
+          });
+          res.status(200).json({ ok: true, action: 'ignored_missing_ids' });
+          return;
+        }
+
+        const { cents, currency } = refundedAmount(refund);
+        if (cents === null) {
+          logger.error('shopify refund carries no parseable amount; NOT credited', {
+            shop_domain: shopDomain,
+            shopify_order_id: orderId,
+          });
+          res.status(200).json({ ok: true, action: 'ignored_unparseable_amount' });
+          return;
+        }
+        if (cents === 0) {
+          // Restock-only refund: no money moved, no commission to reverse.
+          res.status(200).json({ ok: true, action: 'ignored_zero_amount' });
+          return;
+        }
+
+        await respondWithAdjustment(
+          res,
+          { shop_domain: shopDomain, shopify_order_id: orderId, refund_id: refundId },
+          {
+            merchantId: merchant.id,
+            shopifyOrderId: orderId,
+            sourceEventId: `refund:${refundId}`,
+            kind: 'REFUND',
+            requestedGmv: formatCentsAsDecimal(cents) ?? '0.00',
+            requestedCurrency: currency,
+          }
+        );
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  // ---- POST /shopify/orders-cancelled -------------------------------------
+  router.post(
+    '/shopify/orders-cancelled',
+    rawJson,
+    async (req, res, next) => {
+      try {
+        const gate = await gateShopifyWebhook(req, res, { config, db, logger });
+        if (gate === null) return;
+        const { payload: order, shopDomain, merchant } = gate;
+
+        const shopifyOrderId =
+          parseShopifyId(order.id) ?? parseShopifyId(order.admin_graphql_api_id);
+        if (shopifyOrderId === null) {
+          logger.error('shopify cancellation webhook missing order id; ignoring', {
+            shop_domain: shopDomain,
+          });
+          res.status(200).json({ ok: true, action: 'ignored_missing_order_id' });
+          return;
+        }
+
+        // requestedGmv null = credit everything still creditable: partial
+        // refunds that preceded the cancellation stay counted exactly once
+        // (the ledger clamp subtracts them from the remainder).
+        await respondWithAdjustment(
+          res,
+          { shop_domain: shopDomain, shopify_order_id: shopifyOrderId },
+          {
+            merchantId: merchant.id,
+            shopifyOrderId,
+            sourceEventId: `cancel:${shopifyOrderId}`,
+            kind: 'CANCELLATION',
+            requestedGmv: null,
+            requestedCurrency: parseCurrency(order.currency),
+          }
+        );
+      } catch (err) {
         next(err);
       }
     }

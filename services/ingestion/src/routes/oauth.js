@@ -68,42 +68,61 @@ async function exchangeCodeForToken({ shop, code, apiKey, apiSecret, adminBaseOv
 }
 
 /**
- * Register the orders/create webhook against the merchant's Admin API.
+ * The webhook topics AOP needs and the route each delivers to. orders/create
+ * bills the commission; refunds/create and orders/cancelled credit it back
+ * (routes/webhooks.js) — registering only the first would make billing
+ * charge-only, which is a merchant dispute waiting to happen.
+ */
+const WEBHOOK_TOPICS = [
+  { topic: 'orders/create', route: '/webhooks/shopify/orders-create' },
+  { topic: 'refunds/create', route: '/webhooks/shopify/refunds-create' },
+  { topic: 'orders/cancelled', route: '/webhooks/shopify/orders-cancelled' },
+];
+
+/**
+ * Register every AOP webhook topic against the merchant's Admin API.
  * Non-fatal by design: 422 "address already taken" means a reinstall (the
  * webhook exists) — fine; other failures are logged loudly but do not fail
  * the install (the merchant row exists; webhook registration can be retried
- * by reinstalling, and losing it surfaces immediately as zero reconciliation).
- * @returns {Promise<'registered'|'already_registered'|'failed'>}
+ * by reinstalling, and losing one surfaces as zero reconciliation/credits).
+ * @returns {Promise<Record<string, 'registered'|'already_registered'|'failed'>>}
+ *   per-topic outcome map, logged and echoed to the install response.
  */
-async function registerOrdersWebhook({ shop, accessToken, appUrl, logger, adminBaseOverride }) {
+async function registerWebhooks({ shop, accessToken, appUrl, logger, adminBaseOverride }) {
   const base = adminBaseOverride ?? `https://${shop}`;
-  try {
-    const response = await fetch(`${base}/admin/api/${ADMIN_API_VERSION}/webhooks.json`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        accept: 'application/json',
-        'x-shopify-access-token': accessToken,
-      },
-      body: JSON.stringify({
-        webhook: {
-          topic: 'orders/create',
-          address: `${appUrl.replace(/\/+$/, '')}/webhooks/shopify/orders-create`,
-          format: 'json',
+  const results = {};
+  for (const { topic, route } of WEBHOOK_TOPICS) {
+    try {
+      const response = await fetch(`${base}/admin/api/${ADMIN_API_VERSION}/webhooks.json`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json',
+          'x-shopify-access-token': accessToken,
         },
-      }),
-      signal: AbortSignal.timeout(ADMIN_TIMEOUT_MS),
-    });
-    if (response.status === 422) return 'already_registered'; // reinstall path
-    if (!response.ok) {
-      logger.error('webhook registration failed', { shop, status: response.status });
-      return 'failed';
+        body: JSON.stringify({
+          webhook: {
+            topic,
+            address: `${appUrl.replace(/\/+$/, '')}${route}`,
+            format: 'json',
+          },
+        }),
+        signal: AbortSignal.timeout(ADMIN_TIMEOUT_MS),
+      });
+      if (response.status === 422) {
+        results[topic] = 'already_registered'; // reinstall path
+      } else if (!response.ok) {
+        logger.error('webhook registration failed', { shop, topic, status: response.status });
+        results[topic] = 'failed';
+      } else {
+        results[topic] = 'registered';
+      }
+    } catch (err) {
+      logger.error('webhook registration errored', { shop, topic, err });
+      results[topic] = 'failed';
     }
-    return 'registered';
-  } catch (err) {
-    logger.error('webhook registration errored', { shop, err });
-    return 'failed';
   }
+  return results;
 }
 
 /**
@@ -188,7 +207,7 @@ export function buildOAuthRouter({ config, db, logger, adminBaseOverride }) {
         originUrl: `https://${shop}`,
       });
 
-      const webhookStatus = await registerOrdersWebhook({
+      const webhookStatus = await registerWebhooks({
         shop,
         accessToken,
         appUrl,
@@ -199,13 +218,13 @@ export function buildOAuthRouter({ config, db, logger, adminBaseOverride }) {
       logger.info('merchant installed', {
         shop,
         merchant_id: merchant.id,
-        webhook: webhookStatus,
+        webhooks: webhookStatus,
       });
       res.status(200).json({
         ok: true,
         shop,
         merchant_id: merchant.id,
-        webhook: webhookStatus,
+        webhooks: webhookStatus,
         proxy_hostname: merchant.proxy_hostname ?? null,
         next_step: merchant.proxy_hostname
           ? `Point your ACP/AP2 endpoint configuration at https://${merchant.proxy_hostname} — agent telemetry starts flowing immediately.`

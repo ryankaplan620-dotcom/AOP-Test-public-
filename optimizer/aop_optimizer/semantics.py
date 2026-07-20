@@ -480,9 +480,29 @@ _FREE_SHIP_COND_RES = [
         rf"\b[^.!?\n]{{0,40}}?\b(?:ships?\s+free|free\s+shipping)",
         re.IGNORECASE,
     ),
-    # "spend $75 for free shipping" / "spend $75+ to unlock free shipping"
+    # "spend $75 for free shipping" / "spend over $75 to unlock free shipping"
     re.compile(
-        rf"\bspend\s+\$?\s*{_MONEY}\s*\+?\b[^.!?\n]{{0,40}}?\bfree\s+shipping",
+        rf"\bspend\s+(?:over|above|at\s+least|more\s+than|a\s+minimum\s+of)?\s*\$?\s*{_MONEY}\s*\+?\b[^.!?\n]{{0,40}}?\bfree\s+shipping",
+        re.IGNORECASE,
+    ),
+    # "free shipping when you spend $50" / "free shipping if you spend over $50"
+    re.compile(
+        rf"\bfree\s+(?:standard\s+|ground\s+|express\s+)?shipping\b"
+        rf"[^.!?\n]{{0,40}}?\b(?:when|if|once)\s+you\s+spend\s+"
+        rf"(?:over|above|at\s+least|more\s+than|a\s+minimum\s+of)?\s*\$?\s*{_MONEY}",
+        re.IGNORECASE,
+    ),
+    # "free shipping on orders $50+" / "free shipping on orders of $75 or more"
+    re.compile(
+        rf"\bfree\s+(?:standard\s+|ground\s+|express\s+)?shipping\b"
+        rf"[^.!?\n]{{0,40}}?\b(?:orders?|purchases?)\s+(?:of\s+)?\$?\s*{_MONEY}"
+        rf"\s*(?:\+|or\s+more|and\s+(?:up|above|over))",
+        re.IGNORECASE,
+    ),
+    # "free shipping with a minimum purchase/order of $X" / "minimum spend of $X"
+    re.compile(
+        rf"\bfree\s+(?:standard\s+|ground\s+|express\s+)?shipping\b"
+        rf"[^.!?\n]{{0,40}}?\bminimum\s+(?:purchase|order|spend)\s+(?:of\s+)?\$?\s*{_MONEY}",
         re.IGNORECASE,
     ),
 ]
@@ -551,6 +571,17 @@ def _extract_free_shipping(text: str, metrics: PolicyMetrics) -> None:
 #   "$10 restocking fee"               -> amt_b=10
 #   "restocking fee of $7.50"          -> amt_a=7.50
 #   "a restocking fee applies"         -> no magnitude captured
+# Negation-aware: "no/zero restocking fees", "without a restocking fee",
+# "never charge restocking fees" are PROMISES, not penalties — the exact
+# phrasing our own REMOVE_RESTOCKING_FEE directive tells merchants to
+# publish, which previously re-triggered this probe and made the projected
+# score gain unachievable.
+_RESTOCK_NEGATION_RE = re.compile(
+    r"\b(?:no|zero|without\s+(?:a|any)?|never\s+charge(?:s|d)?(?:\s+a|\s+any)?|not?\s+subject\s+to\s+(?:a|any)?)"
+    r"\s*(?:hidden\s+)?restock(?:ing)?\s+fees?",
+    re.IGNORECASE,
+)
+
 _RESTOCK_RE = re.compile(
     r"(?:(?P<pct_b>\d{1,3}(?:\.\d+)?)\s*(?:%|percent)\s*"
     r"|\$\s*(?P<amt_b>\d{1,6}(?:\.\d{1,2})?)\s*)?"
@@ -568,7 +599,16 @@ _STORE_CREDIT_RE = re.compile(
     r"|\bonly\s+(?:issue|offer|provide|receive)?\s*store[\s-]*credit\b"
     r"|\brefund(?:s|ed)?\s+(?:will\s+be\s+|are\s+)?(?:issued\s+|given\s+|provided\s+)?"
     r"(?:as|in|to|via)\s+store[\s-]*credit\b"
-    r"|\b(?:for|as|in)\s+store[\s-]*credit(?:\s+only)?\b)",
+    # NOTE: no bare "(for|as|in) store credit" branch — "you may opt for
+    # store credit" merely OFFERS credit as an option and must not be
+    # penalized as credit-ONLY; exclusivity requires "only" adjacency OR a
+    # returns-verb subject within a short gap (below): "returned for store
+    # credit" states the policy outcome, while opt-in phrasings put the
+    # choice words ("you may choose a refund or opt for...") in between and
+    # overflow the 30-char gap.
+    r"|\b(?:for|as|in)\s+store[\s-]*credit\s+only\b"
+    r"|\breturn(?:s|ed)?\b[^.!?\n]{0,30}?\b(?:for|as|in|to)\s+store[\s-]*credit\b"
+    r"|\bexchang(?:e|ed|es)\b[^.!?\n]{0,30}?\bfor\s+store[\s-]*credit\b)",
     re.IGNORECASE,
 )
 
@@ -648,7 +688,9 @@ def _extract_hidden_penalties(text: str, metrics: PolicyMetrics) -> None:
     """
     found: List[HiddenPenaltyTerm] = []
 
-    restock = _RESTOCK_RE.search(text)
+    # Remove negated ("no restocking fees") mentions first — a merchant
+    # PROMISING the absence of a fee must never be penalized for the fee.
+    restock = _RESTOCK_RE.search(_RESTOCK_NEGATION_RE.sub(" ", text))
     if restock is not None:
         percent = _to_float(restock.group("pct_b")) or _to_float(restock.group("pct_a"))
         amount = _to_float(restock.group("amt_b")) or _to_float(restock.group("amt_a"))

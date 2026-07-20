@@ -46,6 +46,7 @@ tables defined here.
 | `agent_intent_logs` | High-volume append-only telemetry: every `/availability`, `/shipping_quote`, etc. query an AI agent makes. | Queue consumer path |
 | `reconciled_agent_orders` | Orders attributed back to an intent via transaction token. Source of truth for GMV and the 0.5% commission. | Webhook reconciliation path |
 | `loss_diagnostics` | Exactly one row per intent that expired (60 s window) without converting; classifies why the agent dropped off. | Sweep job |
+| `order_adjustments` | Immutable billing credit ledger: refunds/cancellations of reconciled orders, crediting back the commission at the parent order's snapshotted rate. Statements net charges minus credits. | Webhook credit path |
 
 Plus `schema_migrations` (created by the runner itself, not by a migration
 file) tracking which files have been applied.
@@ -59,6 +60,12 @@ merchant_profiles 1 ---- * loss_diagnostics           (ON DELETE CASCADE)
 
 agent_intent_logs 1 ---- 0..1 reconciled_agent_orders (intent_log_id UNIQUE, ON DELETE SET NULL)
 agent_intent_logs 1 ---- 0..1 loss_diagnostics        (intent_log_id UNIQUE, ON DELETE CASCADE)
+
+merchant_profiles     1 ---- * order_adjustments      (ON DELETE CASCADE)
+reconciled_agent_orders 1 -- * order_adjustments      (ON DELETE CASCADE; sum of
+                                                       a given order's credits is
+                                                       clamped to its GMV by the
+                                                       repository insert)
 ```
 
 Reading the two intent-side links together: every intent eventually resolves

@@ -185,13 +185,28 @@ function ackBatch(batch) {
 }
 
 /**
- * Ask Queues to redeliver the whole batch: prefer batch.retryAll(); otherwise
- * throw so the runtime marks the invocation failed (same redelivery effect).
- * Redelivery + max_retries + the DLQ (see wrangler.toml) is what shields the
- * pipeline from poison messages.
+ * Redelivery backoff. Without a delay, Queues redelivers near-immediately:
+ * a 30-second ingest outage (deploy, DB failover) would burn all 5
+ * max_retries within seconds and strand perfectly good telemetry batches in
+ * the DLQ. 30s x 5 retries rides out ~2.5 minutes of outage instead.
+ */
+export const RETRY_DELAY_SECONDS = 30;
+
+/**
+ * Ask Queues to redeliver the whole batch: prefer batch.retryAll() with an
+ * explicit delay; otherwise throw so the runtime marks the invocation failed
+ * (same redelivery effect, runtime-default backoff). Redelivery +
+ * max_retries + the DLQ (see wrangler.toml) is what shields the pipeline
+ * from poison messages.
  */
 function retryBatch(batch, reason) {
   if (typeof batch?.retryAll === 'function') {
+    try {
+      batch.retryAll({ delaySeconds: RETRY_DELAY_SECONDS });
+      return;
+    } catch {
+      /* older runtime without options support — try the bare form */
+    }
     try {
       batch.retryAll();
       return;
@@ -248,21 +263,14 @@ export default {
 
       if (!originBase) {
         // Unknown hostname and no DEFAULT_ORIGIN (or the route would loop back
-        // to this proxy itself): fail fast with a controlled 502. Still record
-        // the intent attempt — "misrouted agent traffic" is itself a
-        // drop-off diagnosis worth surfacing (shop_domain stays null).
+        // to this proxy itself): fail fast with a controlled 502. NO telemetry
+        // here — a record without a resolvable origin has shop_domain null,
+        // which the ingestion validator rejects by contract (shop_domain is
+        // the tenant key), so queueing it would only burn a queue message and
+        // inflate rejected_invalid on every scanner spray. If "misrouted
+        // agent traffic" analytics are ever wanted, that needs a dedicated
+        // sentinel + consumer, not a dead record.
         const latencyMs = Date.now() - startedAt;
-        if (intercepted) {
-          scheduleTelemetry(ctx, env, {
-            clonedRequest: telemetryClone,
-            url,
-            signature,
-            originBase: null,
-            method: request.method,
-            status: 502,
-            latencyMs,
-          });
-        }
         return errorResponse(
           502,
           'no_origin_configured',
@@ -337,6 +345,29 @@ export default {
       // preserving status/statusText/headers from the origin.
       const proxied = new Response(originResponse.body, originResponse);
       proxied.headers.set('X-AOP-Latency-Ms', String(latencyMs));
+
+      // Redirect rewrite: origins routinely 301/302 (Shopify canonicalization,
+      // trailing slashes). A Location pointing at the ORIGIN host would eject
+      // the agent from the proxy permanently — its next request goes straight
+      // to the origin and telemetry/attribution for the session ends. Rewrite
+      // origin-host Locations back onto the proxy hostname; foreign-host
+      // redirects (off-site payment, CDN) pass through untouched.
+      if (originResponse.status >= 300 && originResponse.status < 400) {
+        try {
+          const location = originResponse.headers.get('Location');
+          if (location) {
+            const target = new URL(location, originUrl);
+            if (target.hostname === originUrl.hostname) {
+              target.hostname = url.hostname;
+              target.protocol = url.protocol;
+              target.port = url.port;
+              proxied.headers.set('Location', target.toString());
+            }
+          }
+        } catch {
+          // Unparseable Location — pass through as-is; never break the reply.
+        }
+      }
 
       // Telemetry is registered AFTER the response object exists and runs
       // AFTER it is returned — zero synchronous cost on the reply.
