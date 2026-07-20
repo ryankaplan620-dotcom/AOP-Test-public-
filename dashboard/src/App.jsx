@@ -13,6 +13,7 @@
 import React, { useState } from 'react';
 import LossDiagnosis from './components/LossDiagnosis.jsx';
 import AgentTraffic from './components/AgentTraffic.jsx';
+import ProofOfLift from './components/ProofOfLift.jsx';
 import DataOptimizer from './components/DataOptimizer.jsx';
 import Simulator from './components/Simulator.jsx';
 import Billing from './components/Billing.jsx';
@@ -22,6 +23,7 @@ import { loadSettings } from './api.js';
 const TABS = [
   { id: 'loss', label: 'Loss Diagnosis' },
   { id: 'traffic', label: 'Agent Traffic' },
+  { id: 'lift', label: 'Proof of Lift' },
   { id: 'optimizer', label: 'Data Optimizer' },
   { id: 'simulator', label: 'What-If Simulator' },
   { id: 'billing', label: 'Billing' },
@@ -56,6 +58,7 @@ export default function App() {
 
       {tab === 'loss' ? <LossDiagnosis settings={settings} /> : null}
       {tab === 'traffic' ? <AgentTraffic settings={settings} /> : null}
+      {tab === 'lift' ? <ProofOfLift settings={settings} /> : null}
       {tab === 'optimizer' ? <DataOptimizer settings={settings} /> : null}
       {tab === 'simulator' ? <Simulator settings={settings} /> : null}
       {tab === 'billing' ? <Billing settings={settings} /> : null}

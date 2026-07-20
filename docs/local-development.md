@@ -171,7 +171,50 @@ curl -s -X DELETE http://localhost:8787/analytics/keys/<id> \
   -H "Authorization: Bearer $DASHBOARD_API_TOKEN"           # revoke
 ```
 
-## 9. Score a store policy
+## 9. Proof of lift + outcome calibration
+
+The dashboard's **Proof of Lift** tab renders `GET /analytics/lift` — weekly
+agent-conversion series plus an exact split-half comparison (recent half of
+the window vs the half before it) and per-reason loss shifts. Observed counts
+only; when the baseline half can't support a relative comparison the lift is
+`null`, never a made-up number:
+
+```bash
+curl -s "http://localhost:8787/analytics/lift?days=56" \
+  -H "Authorization: Bearer $DASHBOARD_API_TOKEN"
+```
+
+The optimizer's selection-probability curve can be calibrated from real
+won/lost sessions (aggregate your merchants' policy scores with their
+observed outcomes — e.g. wins/losses from `/analytics/lift` splits):
+
+```bash
+curl -s -X POST http://localhost:8899/calibrate \
+  -H "Content-Type: application/json" \
+  -H "X-AOP-Calibrate: 1" \
+  -d '{"sessions": [
+        {"score": 48, "wins": 11, "losses": 89},
+        {"score": 62, "wins": 47, "losses": 53},
+        {"score": 78, "wins": 82, "losses": 18}
+      ]}'
+# -> {"ok": true, "mode": "full", "market_baseline_score": ..., ...}
+curl -s http://localhost:8899/calibration          # active curve + provenance
+curl -s -X DELETE -H "X-AOP-Calibrate: 1" \
+  http://localhost:8899/calibrate                  # back to defaults
+```
+
+The `X-AOP-Calibrate: 1` header is required on the two state-mutating verbs —
+a custom header forces a browser CORS preflight the server will fail, so a
+drive-by web page can never recalibrate the curve. Set `AOP_OPTIMIZER_TOKEN`
+to additionally require a bearer token if the port is exposed beyond
+localhost.
+
+An accepted fit becomes the server's active curve — subsequent `/score`,
+`/rewrite`, and `/simulate` responses carry a `calibration` provenance object
+(`fitted` / `default` / `request_override`). A rejected fit (too little data,
+inverted slope, implausible parameters) answers 422 and changes nothing.
+
+## 10. Score a store policy
 
 ```bash
 cd optimizer

@@ -13,6 +13,7 @@
  *   GET /analytics/traffic?days=7       protocol share, prompt categories, top SKUs
  *   GET /analytics/billing?month=YYYY-MM monthly commission statement per merchant
  *   GET /analytics/benchmark?days=7     price-competitiveness benchmark (Benchmark Engine)
+ *   GET /analytics/lift?days=56         proof-of-lift: weekly conversion + split-half deltas
  *   GET /analytics/whoami               credential scope introspection
  * Key management (platform token ONLY):
  *   POST   /analytics/keys              mint a merchant key (plaintext shown once)
@@ -58,6 +59,7 @@ import {
   getTrafficBreakdown,
   getBillingStatement,
   getPriceBenchmark,
+  getLiftReport,
   findMerchantByShopDomain,
   findMerchantByApiKeyHash,
   insertMerchantApiKey,
@@ -318,6 +320,94 @@ export function buildAnalyticsRouter({ config, db, logger }) {
           avg_competitor_price: money(row.avg_competitor_price_cents),
           revenue_lost: row.revenue_lost,
         })),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- GET /analytics/lift -------------------------------------------------
+  // Proof-of-lift: weekly conversion series + exact equal-length split
+  // comparison (recent halfDays vs the same-length period before it) +
+  // loss-reason shifts. OBSERVED counts only — conversion_lift_pct is null
+  // (not 0, not invented) whenever either half has no impressions or the
+  // baseline has no conversions to compare against. Default window 56 days
+  // (8 weekly buckets); ?days overrides within the standard [1, 90] bounds.
+  router.get('/lift', async (req, res, next) => {
+    try {
+      const windowDays = parseWindowDays(req.query.days ?? '56');
+      const halfDays = Math.max(1, Math.floor(windowDays / 2));
+      const raw = await getLiftReport(db, { windowDays, halfDays, merchantId: req.aopAuth.merchantId });
+
+      // Merge the three sparse weekly series on the week key.
+      const weeks = new Map();
+      const weekEntry = (weekValue) => {
+        const key = new Date(weekValue).toISOString();
+        if (!weeks.has(key)) {
+          weeks.set(key, {
+            week_start: key,
+            impressions: 0,
+            orders_won: 0,
+            losses: 0,
+            estimated_revenue_lost: '0',
+          });
+        }
+        return weeks.get(key);
+      };
+      for (const row of raw.weeklyIntents) weekEntry(row.week).impressions = Number(row.impressions);
+      for (const row of raw.weeklyWins) weekEntry(row.week).orders_won = Number(row.orders_won);
+      for (const row of raw.weeklyLosses) {
+        const entry = weekEntry(row.week);
+        entry.losses = Number(row.losses);
+        entry.estimated_revenue_lost = String(row.estimated_revenue_lost);
+      }
+      const weekly = [...weeks.values()]
+        .sort((a, b) => a.week_start.localeCompare(b.week_start))
+        .map((w) => ({ ...w, conversion_rate_pct: percentShare(w.orders_won, w.impressions) }));
+
+      const half = (impressions, orders) => ({
+        impressions: Number(impressions),
+        orders_won: Number(orders),
+        // Display rate only (one-decimal rounding) — the lift ratio below
+        // deliberately does NOT use it.
+        conversion_rate_pct: percentShare(orders, impressions),
+      });
+      const baseline = half(raw.split.imp_baseline, raw.split.won_baseline);
+      const recent = half(raw.split.imp_recent, raw.split.won_recent);
+
+      // Relative lift in conversion rate, computed from RAW COUNTS — the
+      // display rates are rounded to one decimal and dividing rounded
+      // values would fabricate or erase lift at low conversion rates (a
+      // 0.078% -> 0.122% move both display as 0.1%). Null when unknowable:
+      // no impressions in either half, or zero baseline conversions
+      // (relative change from zero is undefined — the absolute rates are
+      // right there for that case).
+      const conversionLiftPct =
+        baseline.impressions > 0 && recent.impressions > 0 && baseline.orders_won > 0
+          ? Math.round(
+              ((recent.orders_won / recent.impressions) / (baseline.orders_won / baseline.impressions) - 1) * 1000
+            ) / 10
+          : null;
+
+      res.json({
+        window_days: windowDays,
+        recent_days: halfDays,
+        // Equal-length halves (see getLiftReport): raw-count reason deltas
+        // stay duration-fair for odd windows.
+        baseline_days: halfDays,
+        baseline,
+        recent,
+        conversion_lift_pct: conversionLiftPct,
+        weekly,
+        // Negative delta = fewer losses of that reason in the recent half.
+        reason_shifts: raw.reasons
+          .map((r) => ({
+            reason: r.reason,
+            baseline_count: Number(r.baseline_count),
+            recent_count: Number(r.recent_count),
+            delta: Number(r.recent_count) - Number(r.baseline_count),
+          }))
+          .sort((a, b) => a.delta - b.delta),
       });
     } catch (err) {
       next(err);

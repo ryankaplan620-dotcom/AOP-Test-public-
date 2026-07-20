@@ -1113,6 +1113,111 @@ export async function findRouteByProxyHostname(db, hostname) {
   return result.rows[0] ? { origin: result.rows[0].origin_url } : null;
 }
 
+/**
+ * Proof-of-lift report data (routes/analytics.js /analytics/lift).
+ *
+ * Answers "is agent conversion actually improving?" with OBSERVED counts
+ * only — no modeled or projected figures (fabricating lift for a product
+ * that bills on it would be indefensible):
+ *   - weekly: impressions / wins / losses / estimated loss revenue per ISO
+ *     week over the window (date_trunc buckets, sparse — weeks with no rows
+ *     for a table simply don't appear in that series and merge as zero),
+ *   - split: recent halfDays vs the EQUAL-LENGTH period immediately before
+ *     it, split in SQL so the halves are exact (equal durations keep raw-
+ *     count comparisons duration-fair even for odd windows),
+ *   - reasons: per-loss-reason counts for each half (what got better/worse).
+ *
+ * All five statements carry the standard tenant scope ($-last::uuid IS NULL
+ * OR merchant_id = $-last) like every other analytics read.
+ *
+ * @param {object} db
+ * @param {{windowDays: number, halfDays: number, merchantId?: string|null}} options
+ * @returns {Promise<{weeklyIntents: Array, weeklyWins: Array, weeklyLosses:
+ *   Array, split: object, reasons: Array}>} raw rows; the route assembles
+ *   the report shape.
+ */
+export async function getLiftReport(db, { windowDays, halfDays, merchantId = null }) {
+  const [weeklyIntents, weeklyWins, weeklyLosses, split, reasons] = await Promise.all([
+    db.query(
+      `SELECT date_trunc('week', processed_at) AS week, count(*)::bigint AS impressions
+         FROM agent_intent_logs
+        WHERE processed_at >= now() - make_interval(days => $1)
+          AND ($2::uuid IS NULL OR merchant_id = $2)
+        GROUP BY 1
+        ORDER BY 1`,
+      [windowDays, merchantId]
+    ),
+    db.query(
+      `SELECT date_trunc('week', reconciled_at) AS week, count(*)::bigint AS orders_won
+         FROM reconciled_agent_orders
+        WHERE reconciled_at >= now() - make_interval(days => $1)
+          AND ($2::uuid IS NULL OR merchant_id = $2)
+        GROUP BY 1
+        ORDER BY 1`,
+      [windowDays, merchantId]
+    ),
+    db.query(
+      `SELECT date_trunc('week', created_at) AS week,
+              count(*)::bigint AS losses,
+              COALESCE(sum(estimated_revenue_lost), 0) AS estimated_revenue_lost
+         FROM loss_diagnostics
+        WHERE created_at >= now() - make_interval(days => $1)
+          AND ($2::uuid IS NULL OR merchant_id = $2)
+        GROUP BY 1
+        ORDER BY 1`,
+      [windowDays, merchantId]
+    ),
+    // Exact split-half counts (the lift numerator/denominator): recent =
+    // the last halfDays, baseline = the EQUAL-LENGTH period immediately
+    // before it. Equal durations are load-bearing — raw-count deltas
+    // (reason_shifts) would otherwise report phantom improvement whenever
+    // an odd window made the baseline a day longer. For windowDays = 1 the
+    // baseline day precedes the requested window; the response labels both
+    // durations explicitly.
+    db.query(
+      `SELECT
+         (SELECT count(*) FROM agent_intent_logs
+           WHERE processed_at >= now() - make_interval(days => $1)
+             AND ($2::uuid IS NULL OR merchant_id = $2))                      AS imp_recent,
+         (SELECT count(*) FROM agent_intent_logs
+           WHERE processed_at >= now() - make_interval(days => $1 * 2)
+             AND processed_at < now() - make_interval(days => $1)
+             AND ($2::uuid IS NULL OR merchant_id = $2))                      AS imp_baseline,
+         (SELECT count(*) FROM reconciled_agent_orders
+           WHERE reconciled_at >= now() - make_interval(days => $1)
+             AND ($2::uuid IS NULL OR merchant_id = $2))                      AS won_recent,
+         (SELECT count(*) FROM reconciled_agent_orders
+           WHERE reconciled_at >= now() - make_interval(days => $1 * 2)
+             AND reconciled_at < now() - make_interval(days => $1)
+             AND ($2::uuid IS NULL OR merchant_id = $2))                      AS won_baseline`,
+      [halfDays, merchantId]
+    ),
+    db.query(
+      `SELECT calculated_loss_reason AS reason,
+              count(*) FILTER (WHERE created_at >= now() - make_interval(days => $2))::bigint AS recent_count,
+              count(*) FILTER (WHERE created_at >= now() - make_interval(days => $2 * 2)
+                                 AND created_at < now() - make_interval(days => $2))::bigint AS baseline_count
+         FROM loss_diagnostics
+        WHERE created_at >= now() - make_interval(days => GREATEST($1, $2 * 2))
+          AND ($3::uuid IS NULL OR merchant_id = $3)
+        GROUP BY 1
+        -- Odd windows: rows older than both halves are in the outer bound
+        -- but neither FILTER; a reason seen ONLY there would be a 0/0 noise
+        -- line — drop it.
+        HAVING count(*) FILTER (WHERE created_at >= now() - make_interval(days => $2 * 2)) > 0
+        ORDER BY 1`,
+      [windowDays, halfDays, merchantId]
+    ),
+  ]);
+  return {
+    weeklyIntents: weeklyIntents.rows,
+    weeklyWins: weeklyWins.rows,
+    weeklyLosses: weeklyLosses.rows,
+    split: split.rows[0] ?? { imp_recent: 0, imp_baseline: 0, won_recent: 0, won_baseline: 0 },
+    reasons: reasons.rows,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Merchant API keys (migration 0014) — multi-tenant /analytics auth.
 // Plaintext keys NEVER reach this module: routes hash first (lib/api-keys.js)

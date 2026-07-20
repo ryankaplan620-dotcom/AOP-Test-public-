@@ -24,7 +24,27 @@ admin panel") exposes exactly two POST endpoints:
                       plus counterfactual scenarios (extend returns, faster
                       shipping, drop each penalty, free shipping, ceiling),
                       each with score/probability deltas
+    POST /calibrate {"sessions": [{"score": n, "wins": n, "losses": n}, ...]}
+                   -> outcome calibration (calibration.py): fits the
+                      selection curve from real won/lost sessions and, on an
+                      accepted fit, makes it the server's active curve. A
+                      rejected fit (insufficient data, inverted slope,
+                      implausible parameters) changes NOTHING and answers 422
+                      with the reason.
+    GET  /calibration -> the active curve + provenance
+    DELETE /calibrate -> drop the fitted curve, back to defaults
     GET  /healthz  -> {"status": "ok"} liveness probe
+
+The two state-MUTATING endpoints (POST/DELETE /calibrate) require the
+X-AOP-Calibrate: 1 request header — a custom header forces a CORS preflight
+that this server's Allow-Headers will fail, so a drive-by web page can never
+recalibrate the curve cross-origin — and, when AOP_OPTIMIZER_TOKEN is set, a
+matching bearer token as well. The read-only scoring endpoints stay open.
+
+Scoring endpoints resolve baseline/temperature PER FIELD in this order:
+explicit request-body value (operator override) > the fitted calibration >
+the hand-tuned default — and every scoring response carries a "calibration"
+provenance object naming each field's origin.
 
 Design constraints:
   - STDLIB ONLY (http.server) — the optimizer package has zero runtime deps
@@ -42,12 +62,17 @@ Run:  python3 -m aop_optimizer.server            # 127.0.0.1:8899
       AOP_OPTIMIZER_PORT=9000 python3 -m aop_optimizer.server
 """
 
+import hmac
 import json
+import math
 import os
+import re
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 
+from .calibration import DEFAULT_BASELINE, DEFAULT_TEMPERATURE, fit_selection_curve
 from .directives import build_directive_payload
 from .jsonld import build_policy_jsonld
 from .scoring import AgentOptimizationEngine
@@ -100,17 +125,27 @@ def _parse_request(body: bytes) -> Tuple[Optional[Dict[str, Any]], Optional[str]
     if not isinstance(policy_text, str) or not policy_text.strip():
         return None, "policy_text (non-empty string) is required"
 
-    def _num(name: str, default: float) -> Optional[float]:
-        value = data.get(name, default)
+    # baseline/temperature stay None when ABSENT: the handler then falls
+    # back to the fitted calibration (if any) and finally the defaults.
+    # Explicit values remain an operator override and must validate.
+    def _num(name: str) -> Tuple[Optional[float], bool]:
+        if name not in data:
+            return None, True
+        value = data.get(name)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        return float(value)
+            return None, False
+        # json.loads accepts NaN/Infinity tokens; a non-finite override would
+        # silently degrade to engine defaults while provenance claimed
+        # "request_override" — reject it here instead.
+        if not math.isfinite(float(value)):
+            return None, False
+        return float(value), True
 
-    baseline = _num("baseline", 62.0)
-    temperature = _num("temperature", 12.0)
-    if baseline is None:
+    baseline, baseline_ok = _num("baseline")
+    temperature, temperature_ok = _num("temperature")
+    if not baseline_ok:
         return None, "baseline must be a number"
-    if temperature is None or temperature <= 0:
+    if not temperature_ok or (temperature is not None and temperature <= 0):
         return None, "temperature must be a number > 0"
 
     return {"policy_text": policy_text, "baseline": baseline, "temperature": temperature}, None
@@ -135,8 +170,84 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
 
     def _send_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    # ------------------------------------------------------- calibration
+    def _get_calibration(self) -> Optional[Dict[str, Any]]:
+        with self.server.calibration_lock:  # type: ignore[attr-defined]
+            return self.server.calibration  # type: ignore[attr-defined]
+
+    def _set_calibration(self, value: Optional[Dict[str, Any]]) -> None:
+        with self.server.calibration_lock:  # type: ignore[attr-defined]
+            self.server.calibration = value  # type: ignore[attr-defined]
+
+    def _resolve_curve(self, params: Dict[str, Any]) -> Tuple[float, float, Dict[str, Any]]:
+        """Effective (baseline, temperature, provenance) for one request.
+
+        Resolution is PER FIELD: request value > fitted calibration >
+        hand-tuned default, independently for baseline and temperature — an
+        operator probing "what if the baseline were 55?" against a
+        calibrated server keeps the FITTED temperature, not the default.
+        Provenance discloses each field's origin so a stored report can
+        never silently mix layers.
+        """
+        fitted = self._get_calibration()
+
+        def resolve(request_value: Optional[float], fitted_key: str, default: float) -> Tuple[float, str]:
+            if request_value is not None:
+                return request_value, "request"
+            if fitted is not None:
+                return fitted[fitted_key], "fitted"
+            return default, "default"
+
+        baseline, baseline_source = resolve(params["baseline"], "market_baseline_score", DEFAULT_BASELINE)
+        temperature, temperature_source = resolve(
+            params["temperature"], "probability_temperature", DEFAULT_TEMPERATURE
+        )
+        sources = (baseline_source, temperature_source)
+        source = "request_override" if "request" in sources else ("fitted" if "fitted" in sources else "default")
+        provenance: Dict[str, Any] = {
+            "source": source,
+            "baseline_source": baseline_source,
+            "temperature_source": temperature_source,
+        }
+        if "fitted" in sources and fitted is not None:
+            provenance.update(
+                {
+                    "mode": fitted["mode"],
+                    "n_sessions": fitted["n_sessions"],
+                    "log_loss": fitted["log_loss"],
+                    "default_log_loss": fitted["default_log_loss"],
+                }
+            )
+        return baseline, temperature, provenance
+
+    def _calibrate_authorized(self) -> bool:
+        """Gate for the state-MUTATING /calibrate endpoints.
+
+        Two layers:
+          - X-AOP-Calibrate: 1 must be present. A custom request header
+            forces browsers into a CORS preflight, and this server's
+            Allow-Headers only lists Content-Type — so a drive-by web page
+            can never send it cross-origin (the scoring endpoints stay
+            wide-open by design; they mutate nothing). curl/operators just
+            add the header.
+          - If AOP_OPTIMIZER_TOKEN is set in the environment, a matching
+            bearer token is also required (constant-time compare) — for
+            deployments that expose the port beyond 127.0.0.1.
+        """
+        if self.headers.get("X-AOP-Calibrate") != "1":
+            self._send_json(403, {"error": "calibration requires the X-AOP-Calibrate: 1 header"})
+            return False
+        expected = os.environ.get("AOP_OPTIMIZER_TOKEN", "").strip()
+        if expected:
+            match = re.match(r"^Bearer\s+(.+)$", self.headers.get("Authorization", "") or "", re.IGNORECASE)
+            presented = match.group(1).strip() if match else ""
+            if not hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
+                self._send_json(401, {"error": "unauthorized"})
+                return False
+        return True
 
     def _read_body(self) -> Optional[bytes]:
         """Bounded body read; None means the request was already rejected."""
@@ -164,14 +275,57 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self._send_json(200, {"status": "ok"})
             return
+        if self.path == "/calibration":
+            fitted = self._get_calibration()
+            if fitted is None:
+                self._send_json(
+                    200,
+                    {
+                        "source": "default",
+                        "market_baseline_score": DEFAULT_BASELINE,
+                        "probability_temperature": DEFAULT_TEMPERATURE,
+                    },
+                )
+            else:
+                self._send_json(200, {"source": "fitted", **fitted})
+            return
         self._send_json(404, {"error": "not found"})
 
+    def do_DELETE(self) -> None:  # noqa: N802
+        if self.path != "/calibrate":
+            self._send_json(404, {"error": "not found"})
+            return
+        if not self._calibrate_authorized():
+            return
+        self._set_calibration(None)
+        self._send_json(200, {"source": "default", "reset": True})
+
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in ("/score", "/rewrite", "/simulate", "/claims"):
+        if self.path not in ("/score", "/rewrite", "/simulate", "/claims", "/calibrate"):
             self._send_json(404, {"error": "not found"})
             return
         body = self._read_body()
         if body is None:
+            return
+
+        if self.path == "/calibrate":
+            if not self._calibrate_authorized():
+                return
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"error": "request body must be valid JSON"})
+                return
+            sessions = data.get("sessions") if isinstance(data, dict) else None
+            result = fit_selection_curve(sessions)
+            if not result.get("ok"):
+                # A rejected fit changes NOTHING: the active curve (fitted or
+                # default) stays. 422: the request was well-formed, the DATA
+                # cannot support a defensible curve.
+                self._send_json(422, {"error": "calibration_rejected", **result})
+                return
+            self._set_calibration(result)
+            self._send_json(200, result)
             return
 
         if self.path == "/claims":
@@ -195,16 +349,15 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
         if error is not None:
             self._send_json(400, {"error": error})
             return
+        baseline, temperature, provenance = self._resolve_curve(params)
         try:
             if self.path == "/simulate":
-                payload = _run_simulation(
-                    params["policy_text"], params["baseline"], params["temperature"]
-                )
+                payload = _run_simulation(params["policy_text"], baseline, temperature)
             else:
                 payload = _run_pipeline(
                     params["policy_text"],
-                    params["baseline"],
-                    params["temperature"],
+                    baseline,
+                    temperature,
                     with_jsonld=(self.path == "/rewrite"),
                 )
         except Exception as exc:  # pragma: no cover — pipeline is non-raising
@@ -212,6 +365,9 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
             # never crash the worker thread on a surprise.
             self._send_json(500, {"error": f"internal error: {exc}"})
             return
+        # Server-layer envelope (not part of the directive schema): which
+        # curve produced these probabilities.
+        payload["calibration"] = provenance
         self._send_json(200, payload)
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -222,7 +378,13 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
 
 def make_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
     """Build (but do not start) the server — tests bind port 0 through this."""
-    return ThreadingHTTPServer((host, port), OptimizerRequestHandler)
+    server = ThreadingHTTPServer((host, port), OptimizerRequestHandler)
+    # Calibration state lives on the server object (NOT the module): each
+    # server instance owns its curve, and the threading server needs the lock
+    # because /calibrate can race scoring requests.
+    server.calibration = None  # type: ignore[attr-defined]
+    server.calibration_lock = threading.Lock()  # type: ignore[attr-defined]
+    return server
 
 
 def main() -> int:

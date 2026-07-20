@@ -128,6 +128,13 @@ export function fetchActivity(settings, limit) {
   });
 }
 
+/** Proof-of-lift report: weekly conversion + split-half deltas. */
+export function fetchLift(settings, days) {
+  return request(`${baseOf(settings.analyticsUrl)}/analytics/lift?days=${days}`, {
+    token: settings.dashboardToken,
+  });
+}
+
 /**
  * Credential scope introspection: {role: 'platform'|'merchant', merchant_id,
  * shop_domain}. The Settings tab uses it to verify a pasted credential and

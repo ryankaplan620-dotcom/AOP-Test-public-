@@ -143,8 +143,10 @@ test('merchant key: whoami reports the shop and EVERY data endpoint is tenant-sc
   const db = fakeDb([
     keyLookupHit,
     // Row-shape stubs for queries whose repository code reads rows[0].
+    // (Anchored on estimated_losses — 'AS impressions' would also match the
+    // lift report's weekly series, which needs a different row shape.)
     [
-      /AS impressions/,
+      /AS estimated_losses/,
       { rows: [{ impressions: '0', orders_won: '0', adjustments: '0', losses: '0', estimated_losses: '0' }], rowCount: 1 },
     ],
     [
@@ -170,13 +172,14 @@ test('merchant key: whoami reports the shop and EVERY data endpoint is tenant-sc
     assert.match(lookup.text, /revoked_at IS NULL/);
     assert.ok(!db.statements.some((s) => s.params.includes(key.plaintext)));
 
-    // Drive ALL six data endpoints with the merchant credential.
+    // Drive ALL seven data endpoints with the merchant credential.
     for (const path of [
       '/analytics/summary?days=7',
       '/analytics/loss-reasons?days=7',
       '/analytics/traffic?days=7',
       '/analytics/billing?month=2026-07',
       '/analytics/benchmark?days=7',
+      '/analytics/lift?days=56',
       '/analytics/activity?limit=5',
     ]) {
       const r = await get(app.url, path, key.plaintext);
@@ -185,12 +188,18 @@ test('merchant key: whoami reports the shop and EVERY data endpoint is tenant-sc
 
     // Every issued data statement must (a) bind the tenant id as its scoping
     // param and (b) contain the scoping predicate the EXPECTED number of
-    // times. The count matters: getRecentActivity has TWO union branches and
-    // the summary counts query FIVE subselects — params-only assertions
-    // cannot catch a predicate dropped from just one branch, text counts can.
-    const SCOPE_PREDICATE = /\$2::uuid IS NULL OR (?:[a-z]+\.)?merchant_id = \$2/g;
+    // times. The count matters: getRecentActivity has TWO union branches,
+    // the summary counts query FIVE subselects, the lift split FOUR — a
+    // params-only assertion cannot catch a predicate dropped from just one
+    // branch, text counts can.
+    const SCOPE_PREDICATE = /\$\d+::uuid IS NULL OR (?:[a-z]+\.)?merchant_id = \$\d+/g;
     const EXPECTED = [
-      [/AS impressions/, 5], // summary counts: 5 subselects
+      [/date_trunc\('week', processed_at\)/, 1], // lift weekly impressions
+      [/date_trunc\('week', reconciled_at\)/, 1], // lift weekly wins
+      [/date_trunc\('week', created_at\)/, 1], // lift weekly losses
+      [/AS imp_recent/, 4], // lift split-half: 4 subselects
+      [/AS recent_count/, 1], // lift reason shifts
+      [/AS estimated_losses/, 5], // summary counts: 5 subselects
       [/WITH charges/, 2], // summary money: charges + credits CTEs
       [/endpoint_path AS phase/, 1], // summary phase breakdown
       [/GROUP BY calculated_loss_reason/, 1], // loss-reasons
@@ -203,7 +212,7 @@ test('merchant key: whoami reports the shop and EVERY data endpoint is tenant-sc
       [/LIMIT 20/, 1], // benchmark by-SKU
     ];
     const dataStatements = db.statements.filter((s) => !/merchant_api_keys/.test(s.text));
-    assert.equal(dataStatements.length, 11, 'expected 11 scoped data statements');
+    assert.equal(dataStatements.length, 16, 'expected 16 scoped data statements');
     for (const s of dataStatements) {
       const head = s.text.replace(/\s+/g, ' ').slice(0, 70);
       assert.equal(s.params[s.params.length - 1], MERCHANT_ID, `tenant param missing: ${head}`);
