@@ -214,7 +214,58 @@ An accepted fit becomes the server's active curve — subsequent `/score`,
 (`fitted` / `default` / `request_override`). A rejected fit (too little data,
 inverted slope, implausible parameters) answers 422 and changes nothing.
 
-## 10. Score a store policy
+## 10. Edge response enrichment (inject verified JSON-LD at the proxy)
+
+The edge can inject a merchant's **optimizer-verified** schema.org JSON-LD
+into their HTML responses — agents see machine-readable policy/product
+claims with zero storefront changes. Off by default per merchant; the write
+path validates shape (schema.org `@context` + `@type`), size (≤32KB), and
+the payload is injected verbatim (the only transform is escaping `<` inside
+the serialized JSON so it can never break out of its script tag):
+
+```bash
+# 1. Produce verified JSON-LD from the merchant's REAL policy text — the
+#    optimizer's /rewrite returns schema.org blocks under policy_jsonld;
+#    compose the block you want to publish (context + typed body):
+curl -s -X POST http://localhost:8899/rewrite \
+  -H "Content-Type: application/json" \
+  -d '{"policy_text": "30-day returns. Ships in 2 business days."}' \
+  | python3 -c "
+import json, sys
+p = json.load(sys.stdin)['policy_jsonld']['optimized']
+print(json.dumps({'@context': p['@context'], **p['returnPolicy']}, indent=2))"
+
+# 2. Store it + enable the gate (platform token):
+curl -s -X PUT http://localhost:8787/analytics/enrichment \
+  -H "Authorization: Bearer $DASHBOARD_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"shop_domain": "redthread.myshopify.com",
+       "jsonld": {"@context": "https://schema.org", "@type": "Organization",
+                  "name": "Red Thread",
+                  "hasMerchantReturnPolicy": {"@type": "MerchantReturnPolicy",
+                                              "merchantReturnDays": 30}},
+       "enabled": true}'
+
+# 3. The edge bundles it with route resolution (/routes/resolve) and injects
+#    it into GET+200+text/html responses, tagged data-aop-enriched="true"
+#    and x-aop-enriched: 1. Disable any time:
+curl -s -X PUT http://localhost:8787/analytics/enrichment \
+  -H "Authorization: Bearer $DASHBOARD_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"shop_domain": "redthread.myshopify.com", "jsonld": null, "enabled": false}'
+```
+
+Enrichment requires the merchant to be **dynamically routed** — proxy_hostname
++ origin_url in `merchant_profiles`, which the OAuth install populates. The
+payload rides the **same** `/routes/resolve` answer as dynamic routing (one
+control-plane round trip serves both; changes land within ~60s). The edge
+reply path never fetches — it reads the payload from that shared per-isolate
+cache synchronously, so a slow or down control plane can never add latency to
+any merchant's HTML. Merchants pinned via the static `MERCHANT_ROUTES` worker
+config (a redeploy-time escape hatch that bypasses the database) are not
+enriched.
+
+## 11. Score a store policy
 
 ```bash
 cd optimizer

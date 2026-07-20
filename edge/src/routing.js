@@ -191,88 +191,127 @@ const RESOLVE_TIMEOUT_MS = 1_500;
  */
 const DYNAMIC_CACHE_MAX_ENTRIES = 2_000;
 
-/** hostname -> {origin: string|null, expiresAt: number} */
-let dynamicCache = new Map();
-/** hostname -> Promise<string|null> for in-flight dedup. */
-let dynamicInFlight = new Map();
+/**
+ * hostname -> {origin: string|null, enrichment: object|Array|null,
+ *              expiresAt: number}
+ * ONE cache for BOTH features: a single /routes/resolve answer carries the
+ * origin (dynamic routing) and the enrichment payload (PR12), so the edge
+ * pays exactly one control-plane round trip per hostname per TTL — the
+ * "one round trip for both" contract the PR12 diff promised but originally
+ * broke by giving enrichment its own cache + fetch.
+ */
+let routeCache = new Map();
+/** hostname -> Promise<{origin, enrichment}> for in-flight dedup. */
+let routeInFlight = new Map();
 
 /** Test hook: reset dynamic-resolution state between unit tests. */
 export function clearDynamicRouteCache() {
-  dynamicCache = new Map();
-  dynamicInFlight = new Map();
+  routeCache = new Map();
+  routeInFlight = new Map();
+}
+
+/** Fields eligible for the suffix/base gates. Returns '' when ungated-out. */
+function resolveGate(hostname, env) {
+  const host = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+  if (host === '') return { host: '', base: '' };
+  const suffix =
+    typeof env?.PROXY_HOSTNAME_SUFFIX === 'string' ? env.PROXY_HOSTNAME_SUFFIX.trim().toLowerCase() : '';
+  if (suffix !== '' && !host.endsWith(suffix)) return { host, base: '' };
+  const base = typeof env?.INGEST_API_URL === 'string' ? env.INGEST_API_URL.trim().replace(/\/+$/, '') : '';
+  return { host, base };
 }
 
 /**
- * Resolve a hostname via the ingestion service's /routes/resolve endpoint.
+ * Resolve a hostname's full route record (origin + enrichment) via
+ * /routes/resolve, memoized + in-flight-deduped per isolate. Never throws;
+ * both fields default to null. null origins are cached (negative TTL) so
+ * scanner sprays don't hammer the control plane.
  *
- * Never throws; resolves to a normalized origin or null. null results are
- * ALSO cached (negative TTL) — the fetch handler turns them into the same
- * controlled 502 as before.
+ * @returns {Promise<{origin: string|null, enrichment: object|Array|null}>}
+ */
+async function resolveRoute(hostname, env) {
+  const { host, base } = resolveGate(hostname, env);
+  if (host === '' || base === '') return { origin: null, enrichment: null };
+
+  const cached = routeCache.get(host);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { origin: cached.origin, enrichment: cached.enrichment };
+  }
+  const inFlight = routeInFlight.get(host);
+  if (inFlight) return inFlight;
+
+  const lookup = (async () => {
+    let origin = null;
+    let enrichment = null;
+    try {
+      const headers = { accept: 'application/json' };
+      const token = env?.INGEST_API_TOKEN;
+      if (typeof token === 'string' && token !== '') headers.authorization = `Bearer ${token}`;
+      const response = await fetch(`${base}/routes/resolve?hostname=${encodeURIComponent(host)}`, {
+        headers,
+        signal:
+          typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(RESOLVE_TIMEOUT_MS) : undefined,
+      });
+      if (response.ok) {
+        const payload = await response.json().catch(() => null);
+        origin = normalizeOrigin(payload?.origin);
+        if (origin !== null && new URL(origin).hostname.toLowerCase() === host) origin = null;
+        const candidate = payload?.enrichment;
+        enrichment = candidate !== null && typeof candidate === 'object' ? candidate : null;
+      }
+    } catch {
+      origin = null;
+      enrichment = null;
+    }
+    if (routeCache.size >= DYNAMIC_CACHE_MAX_ENTRIES && !routeCache.has(host)) {
+      const oldest = routeCache.keys().next().value;
+      if (oldest !== undefined) routeCache.delete(oldest);
+    }
+    // Positive TTL when we learned ANYTHING (a routable origin or an
+    // enrichment payload); negative TTL only when the host is fully unknown.
+    const known = origin !== null || enrichment !== null;
+    routeCache.set(host, {
+      origin,
+      enrichment,
+      expiresAt: Date.now() + (known ? DYNAMIC_POSITIVE_TTL_MS : DYNAMIC_NEGATIVE_TTL_MS),
+    });
+    return { origin, enrichment };
+  })();
+
+  routeInFlight.set(host, lookup);
+  try {
+    return await lookup;
+  } finally {
+    routeInFlight.delete(host);
+  }
+}
+
+/**
+ * Resolve a hostname to its merchant origin (dynamic-routing entrypoint).
+ * Thin wrapper over the shared route resolver. Never throws.
  *
- * @param {string} hostname incoming request hostname.
- * @param {object} env worker vars (INGEST_API_URL, INGEST_API_TOKEN,
- *   PROXY_HOSTNAME_SUFFIX optional).
  * @returns {Promise<string|null>}
  */
 export async function resolveOriginDynamic(hostname, env) {
   try {
-    const host = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
-    if (host === '') return null;
-
-    // Suffix gate: bound lookups to our own proxy namespace when configured.
-    const suffix =
-      typeof env?.PROXY_HOSTNAME_SUFFIX === 'string' ? env.PROXY_HOSTNAME_SUFFIX.trim().toLowerCase() : '';
-    if (suffix !== '' && !host.endsWith(suffix)) return null;
-
-    const base = typeof env?.INGEST_API_URL === 'string' ? env.INGEST_API_URL.trim().replace(/\/+$/, '') : '';
-    if (base === '') return null; // dynamic routing unconfigured — static only
-
-    const cached = dynamicCache.get(host);
-    if (cached && cached.expiresAt > Date.now()) return cached.origin;
-
-    const inFlight = dynamicInFlight.get(host);
-    if (inFlight) return inFlight;
-
-    const lookup = (async () => {
-      let origin = null;
-      try {
-        const headers = { accept: 'application/json' };
-        const token = env?.INGEST_API_TOKEN;
-        if (typeof token === 'string' && token !== '') headers.authorization = `Bearer ${token}`;
-
-        const response = await fetch(`${base}/routes/resolve?hostname=${encodeURIComponent(host)}`, {
-          headers,
-          signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(RESOLVE_TIMEOUT_MS) : undefined,
-        });
-        if (response.ok) {
-          const payload = await response.json().catch(() => null);
-          origin = normalizeOrigin(payload?.origin);
-          // Same self-loop guard as the static path.
-          if (origin !== null && new URL(origin).hostname.toLowerCase() === host) origin = null;
-        }
-        // Non-2xx (404 unknown host, 401 misconfig, 5xx outage) -> null; the
-        // negative TTL below keeps outages from hammering the control plane.
-      } catch {
-        origin = null; // network/timeout — controlled 502 downstream
-      }
-      if (dynamicCache.size >= DYNAMIC_CACHE_MAX_ENTRIES && !dynamicCache.has(host)) {
-        const oldest = dynamicCache.keys().next().value;
-        if (oldest !== undefined) dynamicCache.delete(oldest);
-      }
-      dynamicCache.set(host, {
-        origin,
-        expiresAt: Date.now() + (origin !== null ? DYNAMIC_POSITIVE_TTL_MS : DYNAMIC_NEGATIVE_TTL_MS),
-      });
-      return origin;
-    })();
-
-    dynamicInFlight.set(host, lookup);
-    try {
-      return await lookup;
-    } finally {
-      dynamicInFlight.delete(host);
-    }
+    return (await resolveRoute(hostname, env)).origin;
   } catch {
-    return null; // absolute backstop, same contract as resolveOrigin()
+    return null;
   }
+}
+
+/**
+ * SYNCHRONOUS read of a hostname's cached enrichment payload — NO network,
+ * safe on the reply path.
+ *
+ * @returns {{hit: boolean, jsonld: object|Array|null}} hit=false means the
+ *   host was resolved statically (or not yet resolved) and carries no cached
+ *   enrichment; hit=true with jsonld=null means known-disabled.
+ */
+export function getCachedEnrichment(hostname) {
+  const host = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+  if (host === '') return { hit: false, jsonld: null };
+  const cached = routeCache.get(host);
+  if (!cached || cached.expiresAt <= Date.now()) return { hit: false, jsonld: null };
+  return { hit: true, jsonld: cached.enrichment ?? null };
 }

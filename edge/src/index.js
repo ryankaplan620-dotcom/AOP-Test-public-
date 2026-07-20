@@ -29,7 +29,8 @@
  */
 
 import { extractAgentSignature, buildTelemetryRecord } from './telemetry.js';
-import { resolveOrigin, resolveOriginDynamic } from './routing.js';
+import { resolveOrigin, resolveOriginDynamic, getCachedEnrichment } from './routing.js';
+import { enrichResponse } from './enrich.js';
 
 /**
  * Intent endpoints we intercept for telemetry. Matched as the FINAL path
@@ -383,7 +384,25 @@ export default {
         });
       }
 
-      return proxied;
+      // Edge response enrichment (feature-gated per merchant, enrich.js).
+      // PRIME DIRECTIVE: the reply path NEVER fetches. The enrichment payload
+      // rides the SAME /routes/resolve answer dynamic routing already fetched
+      // (resolveOriginDynamic populated the shared cache above), so this is a
+      // synchronous cache read — one control-plane round trip serves both
+      // routing and enrichment. Statically-routed merchants (a config escape
+      // hatch that bypasses the DB) are never enriched, so a slow/down
+      // control plane can never add TTFB to their HTML.
+      let reply = proxied;
+      try {
+        const cachedEnrichment = getCachedEnrichment(url.hostname);
+        if (cachedEnrichment.hit && cachedEnrichment.jsonld) {
+          reply = await enrichResponse({ request, response: proxied, jsonld: cachedEnrichment.jsonld });
+        }
+      } catch {
+        // Enrichment must never affect the response; fall back to the proxy.
+        reply = proxied;
+      }
+      return reply;
     } catch (err) {
       // Final backstop: the worker must never throw to the runtime — that
       // would surface a raw 1101 error page to the agent. Return structured

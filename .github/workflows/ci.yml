@@ -292,4 +292,29 @@ jobs:
             END IF;
             RAISE NOTICE 'revocation tombstone present (ok)';
           END $$;
+          -- Enrichment (migration 0015): the gate can never be on without a
+          -- payload — the DB CHECK is the last line of that invariant.
+          DO $$
+          BEGIN
+            UPDATE merchant_profiles SET enrichment_enabled = true, enrichment_jsonld = NULL
+             WHERE shopify_shop_domain = 'ci.example.com';
+            RAISE EXCEPTION 'enrichment payload CHECK NOT enforced (enabled without jsonld accepted)';
+          EXCEPTION WHEN check_violation THEN
+            RAISE NOTICE 'enrichment payload CHECK enforced (ok)';
+          END $$;
+          UPDATE merchant_profiles
+             SET enrichment_jsonld = '{"@context":"https://schema.org","@type":"Organization","name":"ci"}'::jsonb,
+                 enrichment_enabled = true
+           WHERE shopify_shop_domain = 'ci.example.com';
+          DO $$
+          DECLARE n bigint;
+          BEGIN
+            SELECT count(*) INTO n FROM merchant_profiles
+             WHERE shopify_shop_domain = 'ci.example.com'
+               AND enrichment_enabled AND enrichment_jsonld ? '@context';
+            IF n IS DISTINCT FROM 1 THEN
+              RAISE EXCEPTION 'enrichment payload round-trip failed: % rows', n;
+            END IF;
+            RAISE NOTICE 'enrichment payload stored + gated (ok)';
+          END $$;
           SQL
