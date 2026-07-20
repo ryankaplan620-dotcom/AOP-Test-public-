@@ -631,21 +631,30 @@ export async function insertLossDiagnostic(
  *     commission: string, adjustments: number, adjusted_gmv: string,
  *     commission_credits: string, net_gmv: string, net_commission: string}>}>}
  */
-export async function getAnalyticsSummary(db, { windowDays }) {
+export async function getAnalyticsSummary(db, { windowDays, merchantId = null }) {
+  // merchantId scoping ($2): NULL means platform-wide (the DASHBOARD_API_TOKEN
+  // view); a UUID restricts every aggregate to that tenant (merchant API key
+  // auth, migration 0014). The `$2::uuid IS NULL OR ...` shape keeps ONE
+  // prepared statement for both roles.
   const [counts, money] = await Promise.all([
     db.query(
       `SELECT
          (SELECT count(*) FROM agent_intent_logs
-           WHERE processed_at >= now() - make_interval(days => $1))            AS impressions,
+           WHERE processed_at >= now() - make_interval(days => $1)
+             AND ($2::uuid IS NULL OR merchant_id = $2))                       AS impressions,
          (SELECT count(*) FROM reconciled_agent_orders
-           WHERE reconciled_at >= now() - make_interval(days => $1))           AS orders_won,
+           WHERE reconciled_at >= now() - make_interval(days => $1)
+             AND ($2::uuid IS NULL OR merchant_id = $2))                       AS orders_won,
          (SELECT count(*) FROM order_adjustments
-           WHERE adjusted_at >= now() - make_interval(days => $1))             AS adjustments,
+           WHERE adjusted_at >= now() - make_interval(days => $1)
+             AND ($2::uuid IS NULL OR merchant_id = $2))                       AS adjustments,
          (SELECT count(*) FROM loss_diagnostics
-           WHERE created_at >= now() - make_interval(days => $1))              AS losses,
+           WHERE created_at >= now() - make_interval(days => $1)
+             AND ($2::uuid IS NULL OR merchant_id = $2))                       AS losses,
          (SELECT COALESCE(sum(estimated_revenue_lost), 0) FROM loss_diagnostics
-           WHERE created_at >= now() - make_interval(days => $1))              AS estimated_losses`,
-      [windowDays]
+           WHERE created_at >= now() - make_interval(days => $1)
+             AND ($2::uuid IS NULL OR merchant_id = $2))                       AS estimated_losses`,
+      [windowDays, merchantId]
     ),
     // Charges and credits per currency, FULL OUTER JOINed exactly like the
     // billing statement (a window can be credits-only for a currency).
@@ -657,6 +666,7 @@ export async function getAnalyticsSummary(db, { windowDays }) {
                  sum(commission_fee) AS commission
             FROM reconciled_agent_orders
            WHERE reconciled_at >= now() - make_interval(days => $1)
+             AND ($2::uuid IS NULL OR merchant_id = $2)
            GROUP BY COALESCE(currency, 'UNSPECIFIED')
        ),
        credits AS (
@@ -683,6 +693,10 @@ export async function getAnalyticsSummary(db, { windowDays }) {
                WHERE a.reconciled_order_id IN (
                        SELECT DISTINCT w.reconciled_order_id FROM order_adjustments w
                         WHERE w.adjusted_at >= now() - make_interval(days => $1))
+                 -- Tenant scope on the JOINed parent order: the IN pre-filter
+                 -- above is a perf bound only and may admit other merchants'
+                 -- order ids; this predicate is what excludes them.
+                 AND ($2::uuid IS NULL OR r.merchant_id = $2)
                GROUP BY r.id, COALESCE(r.currency, 'UNSPECIFIED'), r.commission_fee
               HAVING count(*) FILTER (WHERE a.adjusted_at >= now() - make_interval(days => $1)) > 0
             ) oc
@@ -700,7 +714,7 @@ export async function getAnalyticsSummary(db, { windowDays }) {
          FROM charges c
          FULL OUTER JOIN credits cr ON cr.currency = c.currency
         ORDER BY COALESCE(c.gmv, 0) DESC`,
-      [windowDays]
+      [windowDays, merchantId]
     ),
   ]);
   const row = counts.rows[0];
@@ -728,16 +742,17 @@ export async function getAnalyticsSummary(db, { windowDays }) {
  * "Top reason for lost agent sales": loss counts + revenue by reason,
  * biggest revenue impact first (what the merchant should fix first).
  */
-export async function getLossReasonBreakdown(db, { windowDays }) {
+export async function getLossReasonBreakdown(db, { windowDays, merchantId = null }) {
   const result = await db.query(
     `SELECT calculated_loss_reason AS reason,
             count(*)::bigint AS count,
             COALESCE(sum(estimated_revenue_lost), 0) AS estimated_revenue_lost
        FROM loss_diagnostics
       WHERE created_at >= now() - make_interval(days => $1)
+        AND ($2::uuid IS NULL OR merchant_id = $2)
       GROUP BY calculated_loss_reason
       ORDER BY sum(estimated_revenue_lost) DESC, count(*) DESC`,
-    [windowDays]
+    [windowDays, merchantId]
   );
   return result.rows.map((row) => ({
     reason: row.reason,
@@ -750,15 +765,16 @@ export async function getLossReasonBreakdown(db, { windowDays }) {
  * "Critical drop-off analysis": which endpoint phase the lost intents died
  * in (/availability vs /shipping_quote), via the diagnostic's intent row.
  */
-export async function getLossPhaseBreakdown(db, { windowDays }) {
+export async function getLossPhaseBreakdown(db, { windowDays, merchantId = null }) {
   const result = await db.query(
     `SELECT i.endpoint_path AS phase, count(*)::bigint AS count
        FROM loss_diagnostics d
        JOIN agent_intent_logs i ON i.id = d.intent_log_id
       WHERE d.created_at >= now() - make_interval(days => $1)
+        AND ($2::uuid IS NULL OR d.merchant_id = $2)
       GROUP BY i.endpoint_path
       ORDER BY count(*) DESC`,
-    [windowDays]
+    [windowDays, merchantId]
   );
   return result.rows.map((row) => ({ phase: row.phase, count: Number(row.count) }));
 }
@@ -769,7 +785,7 @@ export async function getLossPhaseBreakdown(db, { windowDays }) {
  * for protocol/SKU context (orders reconciled on token alone fall back to
  * their denormalized fields). The outer ORDER BY + LIMIT bounds the read.
  */
-export async function getRecentActivity(db, { limit }) {
+export async function getRecentActivity(db, { limit, merchantId = null }) {
   // currency: WON rows carry the reconciled order's ISO code (migration
   // 0010); LOST rows carry NULL — loss estimates are heuristic cents with no
   // currency evidence, and labeling them would be fabrication. The dashboard
@@ -785,6 +801,7 @@ export async function getRecentActivity(db, { limit }) {
                NULL::text                          AS currency
           FROM loss_diagnostics d
           LEFT JOIN agent_intent_logs i ON i.id = d.intent_log_id
+         WHERE ($2::uuid IS NULL OR d.merchant_id = $2)
         UNION ALL
         SELECT r.reconciled_at                     AS occurred_at,
                'WON'                               AS outcome,
@@ -795,10 +812,11 @@ export async function getRecentActivity(db, { limit }) {
                r.currency::text                    AS currency
           FROM reconciled_agent_orders r
           LEFT JOIN agent_intent_logs i ON i.id = r.intent_log_id
+         WHERE ($2::uuid IS NULL OR r.merchant_id = $2)
      ) activity
      ORDER BY occurred_at DESC
      LIMIT $1`,
-    [limit]
+    [limit, merchantId]
   );
   return result.rows;
 }
@@ -843,35 +861,38 @@ export async function upsertMerchantToken(db, { shopDomain, encryptedToken, prox
  * rows without a context signal are excluded from that breakdown rather
  * than pollute it with NULL.
  */
-export async function getTrafficBreakdown(db, { windowDays }) {
+export async function getTrafficBreakdown(db, { windowDays, merchantId = null }) {
   const [protocols, intents, skus] = await Promise.all([
     db.query(
       `SELECT protocol_type AS protocol, count(*)::bigint AS count
          FROM agent_intent_logs
         WHERE processed_at >= now() - make_interval(days => $1)
+          AND ($2::uuid IS NULL OR merchant_id = $2)
         GROUP BY protocol_type
         ORDER BY count(*) DESC`,
-      [windowDays]
+      [windowDays, merchantId]
     ),
     db.query(
       `SELECT inbound_payload->'_edge'->>'intent_category' AS category,
               count(*)::bigint AS count
          FROM agent_intent_logs
         WHERE processed_at >= now() - make_interval(days => $1)
+          AND ($2::uuid IS NULL OR merchant_id = $2)
           AND inbound_payload->'_edge'->>'intent_category' IS NOT NULL
         GROUP BY 1
         ORDER BY count(*) DESC`,
-      [windowDays]
+      [windowDays, merchantId]
     ),
     db.query(
       `SELECT target_sku, count(*)::bigint AS probes
          FROM agent_intent_logs
         WHERE processed_at >= now() - make_interval(days => $1)
+          AND ($2::uuid IS NULL OR merchant_id = $2)
           AND target_sku <> 'UNSPECIFIED'
         GROUP BY target_sku
         ORDER BY count(*) DESC
         LIMIT 10`,
-      [windowDays]
+      [windowDays, merchantId]
     ),
   ]);
   return {
@@ -898,7 +919,7 @@ export async function getTrafficBreakdown(db, { windowDays }) {
  * Month bound is a 'YYYY-MM-01' string cast to date; half-open interval so
  * month boundaries never double-count.
  */
-export async function getBillingStatement(db, { monthStartDate }) {
+export async function getBillingStatement(db, { monthStartDate, merchantId = null }) {
   // Month bounds pinned to UTC explicitly: comparing a timestamptz against a
   // bare ::date resolves through the SERVER's TimeZone setting, silently
   // shifting statement boundaries (and disagreeing with the UTC month label
@@ -928,6 +949,7 @@ export async function getBillingStatement(db, { monthStartDate }) {
           FROM reconciled_agent_orders r, bounds b
          WHERE r.reconciled_at >= b.month_start
            AND r.reconciled_at < b.month_end
+           AND ($2::uuid IS NULL OR r.merchant_id = $2)
          GROUP BY r.merchant_id, COALESCE(r.currency, 'UNSPECIFIED')
      ),
      credits AS (
@@ -952,6 +974,9 @@ export async function getBillingStatement(db, { monthStartDate }) {
                AND a.reconciled_order_id IN (
                      SELECT DISTINCT w.reconciled_order_id FROM order_adjustments w, bounds wb
                       WHERE w.adjusted_at >= wb.month_start AND w.adjusted_at < wb.month_end)
+               -- Tenant scope on the parent order (the IN pre-filter is a
+               -- perf bound only; this predicate enforces isolation).
+               AND ($2::uuid IS NULL OR r.merchant_id = $2)
              GROUP BY r.id, r.merchant_id, r.currency, r.commission_fee, b.month_start
             HAVING count(*) FILTER (WHERE a.adjusted_at >= b.month_start) > 0
           ) oc
@@ -975,7 +1000,7 @@ export async function getBillingStatement(db, { monthStartDate }) {
          ON cr.merchant_id = c.merchant_id AND cr.currency = c.currency
        JOIN merchant_profiles m ON m.id = COALESCE(c.merchant_id, cr.merchant_id)
       ORDER BY (COALESCE(c.commission, 0) - COALESCE(cr.commission_credits, 0)) DESC`,
-    [monthStartDate]
+    [monthStartDate, merchantId]
   );
   return result.rows.map((row) => ({
     merchant_id: row.merchant_id,
@@ -1009,7 +1034,7 @@ export async function getBillingStatement(db, { monthStartDate }) {
  * guard with IS NOT NULL so legacy/foreign rows without evidence are simply
  * excluded rather than poisoning averages.
  */
-export async function getPriceBenchmark(db, { windowDays }) {
+export async function getPriceBenchmark(db, { windowDays, merchantId = null }) {
   const [overall, bySku] = await Promise.all([
     db.query(
       `SELECT count(*)::bigint AS price_losses,
@@ -1020,8 +1045,9 @@ export async function getPriceBenchmark(db, { windowDays }) {
          FROM loss_diagnostics
         WHERE calculated_loss_reason = 'PRICE_DISCREPANCY'
           AND created_at >= now() - make_interval(days => $1)
+          AND ($2::uuid IS NULL OR merchant_id = $2)
           AND (competitor_delta_payload->>'delta_cents') IS NOT NULL`,
-      [windowDays]
+      [windowDays, merchantId]
     ),
     db.query(
       `SELECT target_sku,
@@ -1033,6 +1059,7 @@ export async function getPriceBenchmark(db, { windowDays }) {
          FROM loss_diagnostics
         WHERE calculated_loss_reason = 'PRICE_DISCREPANCY'
           AND created_at >= now() - make_interval(days => $1)
+          AND ($2::uuid IS NULL OR merchant_id = $2)
           AND (competitor_delta_payload->>'delta_cents') IS NOT NULL
           -- The sentinel is not a product: a reprice worklist entry named
           -- UNSPECIFIED is unactionable noise (traffic top-SKUs filters it
@@ -1041,7 +1068,7 @@ export async function getPriceBenchmark(db, { windowDays }) {
         GROUP BY target_sku
         ORDER BY sum(estimated_revenue_lost) DESC
         LIMIT 20`,
-      [windowDays]
+      [windowDays, merchantId]
     ),
   ]);
   const row = overall.rows[0];
@@ -1084,4 +1111,104 @@ export async function findRouteByProxyHostname(db, hostname) {
     [hostname]
   );
   return result.rows[0] ? { origin: result.rows[0].origin_url } : null;
+}
+
+// ---------------------------------------------------------------------------
+// Merchant API keys (migration 0014) — multi-tenant /analytics auth.
+// Plaintext keys NEVER reach this module: routes hash first (lib/api-keys.js)
+// and only the SHA-256 hex digest crosses this boundary.
+// ---------------------------------------------------------------------------
+
+/**
+ * Persist a freshly minted key (routes/analytics.js key management).
+ *
+ * @param {object} db
+ * @param {{merchantId: string, keyHash: string, keyPrefix: string,
+ *          label?: string|null}} row
+ * @returns {Promise<{id: string, key_prefix: string, created_at: Date}>}
+ *   Throws pg error 23505 on a hash collision (2^-128 improbable; the route
+ *   treats it as a retryable server error) and 23503 on unknown merchant.
+ */
+export async function insertMerchantApiKey(db, { merchantId, keyHash, keyPrefix, label = null }) {
+  const result = await db.query(
+    `INSERT INTO merchant_api_keys (merchant_id, key_hash, key_prefix, label)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id, key_prefix, created_at`,
+    [merchantId, keyHash, keyPrefix, label]
+  );
+  return result.rows[0];
+}
+
+/**
+ * Auth hot path: resolve a presented key's digest to its live merchant.
+ * Revoked keys (tombstoned, never deleted) and unknown digests both return
+ * null — the route answers the same uniform 401 for either, so a caller
+ * cannot distinguish "revoked" from "never existed".
+ *
+ * @param {object} db
+ * @param {string} keyHash 64-char lowercase hex (lib/api-keys.js output)
+ * @returns {Promise<{merchant_id: string, shop_domain: string}|null>}
+ */
+export async function findMerchantByApiKeyHash(db, keyHash) {
+  const result = await db.query(
+    `SELECT k.merchant_id, m.shopify_shop_domain
+       FROM merchant_api_keys k
+       JOIN merchant_profiles m ON m.id = k.merchant_id
+      WHERE k.key_hash = $1
+        AND k.revoked_at IS NULL
+      LIMIT 1`,
+    [keyHash]
+  );
+  const row = result.rows[0];
+  return row ? { merchant_id: row.merchant_id, shop_domain: row.shopify_shop_domain } : null;
+}
+
+/**
+ * Key inventory for the platform operator. Returns display fields only —
+ * key_hash deliberately never leaves the repository layer (it is not a
+ * credential, but listing digests invites misuse as one).
+ *
+ * @returns {Promise<Array<{id: string, merchant_id: string, shop_domain:
+ *   string, key_prefix: string, label: string|null, created_at: Date,
+ *   revoked_at: Date|null}>>}
+ */
+export async function listMerchantApiKeys(db, { merchantId = null } = {}) {
+  const result = await db.query(
+    `SELECT k.id, k.merchant_id, m.shopify_shop_domain, k.key_prefix,
+            k.label, k.created_at, k.revoked_at
+       FROM merchant_api_keys k
+       JOIN merchant_profiles m ON m.id = k.merchant_id
+      WHERE ($1::uuid IS NULL OR k.merchant_id = $1)
+      ORDER BY k.created_at DESC`,
+    [merchantId]
+  );
+  return result.rows.map((row) => ({
+    id: row.id,
+    merchant_id: row.merchant_id,
+    shop_domain: row.shopify_shop_domain,
+    key_prefix: row.key_prefix,
+    label: row.label,
+    created_at: row.created_at,
+    revoked_at: row.revoked_at,
+  }));
+}
+
+/**
+ * Revoke a key (idempotent tombstone).
+ *
+ * @returns {Promise<'revoked'|'already_revoked'|'not_found'>} distinct
+ *   outcomes for the ADMIN response only — the auth path never uses this.
+ */
+export async function revokeMerchantApiKey(db, keyId) {
+  const updated = await db.query(
+    `UPDATE merchant_api_keys
+        SET revoked_at = now()
+      WHERE id = $1
+        AND revoked_at IS NULL
+      RETURNING id`,
+    [keyId]
+  );
+  if (updated.rows.length > 0) return 'revoked';
+  const exists = await db.query(`SELECT 1 FROM merchant_api_keys WHERE id = $1`, [keyId]);
+  return exists.rows.length > 0 ? 'already_revoked' : 'not_found';
 }

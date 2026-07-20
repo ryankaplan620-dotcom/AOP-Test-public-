@@ -257,4 +257,39 @@ jobs:
             END IF;
             RAISE NOTICE 'event_id dedup enforced (ok)';
           END $$;
+          -- Merchant API keys (migration 0014): digest shape CHECK and
+          -- hash uniqueness are the auth layer's DB-side invariants.
+          INSERT INTO merchant_api_keys (merchant_id, key_hash, key_prefix, label)
+            SELECT id, repeat('ab', 32), 'aop_live_ci01', 'ci key'
+              FROM merchant_profiles WHERE shopify_shop_domain = 'ci.example.com';
+          DO $$
+          BEGIN
+            INSERT INTO merchant_api_keys (merchant_id, key_hash, key_prefix)
+              SELECT id, upper(repeat('cd', 32)), 'aop_live_ci02'
+                FROM merchant_profiles WHERE shopify_shop_domain = 'ci.example.com';
+            RAISE EXCEPTION 'key_hash shape CHECK NOT enforced (uppercase accepted)';
+          EXCEPTION WHEN check_violation THEN
+            RAISE NOTICE 'key_hash shape CHECK enforced (ok)';
+          END $$;
+          DO $$
+          BEGIN
+            INSERT INTO merchant_api_keys (merchant_id, key_hash, key_prefix)
+              SELECT id, repeat('ab', 32), 'aop_live_ci03'
+                FROM merchant_profiles WHERE shopify_shop_domain = 'ci.example.com';
+            RAISE EXCEPTION 'key_hash uniqueness NOT enforced';
+          EXCEPTION WHEN unique_violation THEN
+            RAISE NOTICE 'key_hash uniqueness enforced (ok)';
+          END $$;
+          -- Revocation is a tombstone: the row survives, revoked_at set.
+          UPDATE merchant_api_keys SET revoked_at = now() WHERE key_prefix = 'aop_live_ci01';
+          DO $$
+          DECLARE n bigint;
+          BEGIN
+            SELECT count(*) INTO n FROM merchant_api_keys
+             WHERE key_prefix = 'aop_live_ci01' AND revoked_at IS NOT NULL;
+            IF n IS DISTINCT FROM 1 THEN
+              RAISE EXCEPTION 'revocation tombstone missing: % rows', n;
+            END IF;
+            RAISE NOTICE 'revocation tombstone present (ok)';
+          END $$;
           SQL
