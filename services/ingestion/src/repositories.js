@@ -1101,8 +1101,13 @@ export async function getPriceBenchmark(db, { windowDays, merchantId = null }) {
  * @returns {Promise<{origin: string}|null>}
  */
 export async function findRouteByProxyHostname(db, hostname) {
+  // enrichment travels with the route answer (migration 0015): the edge asks
+  // this ONE endpoint per hostname per cache-TTL, so bundling the payload
+  // avoids a second control-plane round trip. Disabled merchants ship
+  // enrichment: null — the edge treats that as "never touch responses".
   const result = await db.query(
-    `SELECT origin_url
+    `SELECT origin_url,
+            CASE WHEN enrichment_enabled THEN enrichment_jsonld ELSE NULL END AS enrichment
        FROM merchant_profiles
       WHERE proxy_hostname IS NOT NULL
         AND lower(proxy_hostname) = lower($1)
@@ -1110,7 +1115,60 @@ export async function findRouteByProxyHostname(db, hostname) {
       LIMIT 1`,
     [hostname]
   );
-  return result.rows[0] ? { origin: result.rows[0].origin_url } : null;
+  return result.rows[0]
+    ? { origin: result.rows[0].origin_url, enrichment: result.rows[0].enrichment ?? null }
+    : null;
+}
+
+// ---------------------------------------------------------------------------
+// Edge response enrichment (migration 0015) — optimizer-verified JSON-LD the
+// edge injects into merchant HTML. Managed platform-only via /analytics.
+// ---------------------------------------------------------------------------
+
+/**
+ * Current enrichment config for one merchant (platform management read).
+ *
+ * @returns {Promise<{merchant_id: string, shop_domain: string,
+ *   enabled: boolean, jsonld: object|Array|null,
+ *   updated_at: Date|null}|null>} null for an unknown merchant.
+ */
+export async function getEnrichment(db, merchantId) {
+  const result = await db.query(
+    `SELECT id, shopify_shop_domain, enrichment_enabled, enrichment_jsonld, enrichment_updated_at
+       FROM merchant_profiles
+      WHERE id = $1`,
+    [merchantId]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    merchant_id: row.id,
+    shop_domain: row.shopify_shop_domain,
+    enabled: row.enrichment_enabled,
+    jsonld: row.enrichment_jsonld,
+    updated_at: row.enrichment_updated_at,
+  };
+}
+
+/**
+ * Store/replace a merchant's enrichment payload + gate (platform management
+ * write). jsonld null clears the payload; the DB CHECK refuses enabled=true
+ * with a NULL payload, so the route validates that combination first.
+ *
+ * @returns {Promise<{updated: boolean}>} updated=false for unknown merchant.
+ */
+export async function upsertEnrichment(db, { merchantId, jsonld, enabled }) {
+  const result = await db.query(
+    `UPDATE merchant_profiles
+        SET enrichment_jsonld = $2,
+            enrichment_enabled = $3,
+            enrichment_updated_at = now(),
+            updated_at = now()
+      WHERE id = $1
+      RETURNING id`,
+    [merchantId, jsonld === null ? null : JSON.stringify(jsonld), enabled]
+  );
+  return { updated: result.rows.length > 0 };
 }
 
 /**

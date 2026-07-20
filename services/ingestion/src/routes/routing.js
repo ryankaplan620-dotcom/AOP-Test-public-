@@ -60,7 +60,11 @@ export function buildRoutingRouter({ config, db, logger }) {
         return;
       }
 
-      res.json({ hostname, origin: route.origin });
+      // enrichment (migration 0015): the merchant's optimizer-verified
+      // JSON-LD, bundled with the route so the edge pays ONE control-plane
+      // round trip per hostname per cache TTL for both features. null when
+      // the feature is disabled for this merchant.
+      res.json({ hostname, origin: route.origin, enrichment: route.enrichment ?? null });
     } catch (err) {
       logger.error('route resolution failed', { err, hostname: String(req.query.hostname ?? '') });
       next(err);

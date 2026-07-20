@@ -19,6 +19,9 @@
  *   POST   /analytics/keys              mint a merchant key (plaintext shown once)
  *   GET    /analytics/keys[?merchant_id=] list keys (prefixes only, never hashes)
  *   DELETE /analytics/keys/:id          revoke (idempotent tombstone)
+ * Edge enrichment management (platform token ONLY, migration 0015):
+ *   PUT /analytics/enrichment           store optimizer-verified JSON-LD + gate
+ *   GET /analytics/enrichment?merchant_id= current payload + gate
  *
  * Security model (multi-tenant since migration 0014):
  *   - Read-only aggregates; no per-consumer PII exists downstream anyway
@@ -65,6 +68,8 @@ import {
   insertMerchantApiKey,
   listMerchantApiKeys,
   revokeMerchantApiKey,
+  getEnrichment,
+  upsertEnrichment,
 } from '../repositories.js';
 
 /** Postgres UUID literal gate: bad ids become clean 4xx, never a 22P02 500. */
@@ -527,6 +532,128 @@ export function buildAnalyticsRouter({ config, db, logger }) {
         return;
       }
       res.json({ id: keyId.toLowerCase(), status: outcome });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- Edge enrichment management (platform only, migration 0015) --------
+  // The stored payload is what the EDGE INJECTS VERBATIM into merchant HTML,
+  // so the write path is the fabrication gate: only schema.org-shaped
+  // JSON-LD (produced by the optimizer from merchant-supplied facts) within
+  // a hard size cap is accepted. Nothing here or at the edge generates
+  // content.
+
+  /** Serialized payload cap: cached per-hostname on every edge isolate. */
+  const ENRICHMENT_MAX_BYTES = 32 * 1024;
+
+  /** True for a plausible schema.org JSON-LD block (object form). */
+  function isJsonLdBlock(value) {
+    return (
+      value !== null &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      typeof value['@context'] === 'string' &&
+      /schema\.org/i.test(value['@context']) &&
+      typeof value['@type'] === 'string' &&
+      value['@type'].trim() !== ''
+    );
+  }
+
+  // PUT /analytics/enrichment {merchant_id|shop_domain, jsonld, enabled}
+  router.put('/enrichment', async (req, res, next) => {
+    if (!platformOnly(req, res)) return;
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+
+      let merchantId = null;
+      if (typeof body.merchant_id === 'string' && UUID_SHAPE.test(body.merchant_id.trim())) {
+        merchantId = body.merchant_id.trim().toLowerCase();
+      } else if (typeof body.shop_domain === 'string' && body.shop_domain.trim() !== '') {
+        const merchant = await findMerchantByShopDomain(db, body.shop_domain.trim());
+        merchantId = merchant?.id ?? null;
+      } else {
+        res.status(400).json({ error: 'merchant_id (uuid) or shop_domain is required' });
+        return;
+      }
+      if (merchantId === null) {
+        res.status(404).json({ error: 'merchant not found' });
+        return;
+      }
+
+      if (typeof body.enabled !== 'boolean') {
+        res.status(400).json({ error: 'enabled (boolean) is required' });
+        return;
+      }
+
+      // jsonld: null clears; otherwise one JSON-LD object or a non-empty
+      // array of them, every block schema.org-shaped, bounded size.
+      let jsonld = null;
+      if (body.jsonld !== null && body.jsonld !== undefined) {
+        const blocks = Array.isArray(body.jsonld) ? body.jsonld : [body.jsonld];
+        if (blocks.length === 0 || !blocks.every(isJsonLdBlock)) {
+          res.status(400).json({
+            error: 'jsonld must be a schema.org JSON-LD object (or non-empty array of them) with @context and @type',
+          });
+          return;
+        }
+        let serialized;
+        try {
+          serialized = JSON.stringify(body.jsonld);
+        } catch {
+          res.status(400).json({ error: 'jsonld must be JSON-serializable' });
+          return;
+        }
+        if (Buffer.byteLength(serialized, 'utf8') > ENRICHMENT_MAX_BYTES) {
+          res.status(400).json({ error: `jsonld exceeds ${ENRICHMENT_MAX_BYTES} bytes` });
+          return;
+        }
+        // NUL smuggling guard (PostgreSQL jsonb rejects U+0000 anyway; catch
+        // it here with an honest 400 instead of a 500).
+        if (serialized.includes('\\u0000')) {
+          res.status(400).json({ error: 'jsonld must not contain U+0000' });
+          return;
+        }
+        jsonld = body.jsonld;
+      }
+
+      if (body.enabled === true && jsonld === null) {
+        // Mirrors the DB CHECK: the gate cannot be on with nothing to inject.
+        res.status(400).json({ error: 'enabled=true requires a jsonld payload' });
+        return;
+      }
+
+      const { updated } = await upsertEnrichment(db, { merchantId, jsonld, enabled: body.enabled });
+      if (!updated) {
+        res.status(404).json({ error: 'merchant not found' });
+        return;
+      }
+      logger.info('merchant enrichment updated', {
+        merchant_id: merchantId,
+        enabled: body.enabled,
+        has_payload: jsonld !== null,
+      });
+      res.json(await getEnrichment(db, merchantId));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // GET /analytics/enrichment?merchant_id=uuid
+  router.get('/enrichment', async (req, res, next) => {
+    if (!platformOnly(req, res)) return;
+    try {
+      const raw = String(req.query.merchant_id ?? '').trim();
+      if (!UUID_SHAPE.test(raw)) {
+        res.status(400).json({ error: 'merchant_id (uuid) is required' });
+        return;
+      }
+      const enrichment = await getEnrichment(db, raw.toLowerCase());
+      if (enrichment === null) {
+        res.status(404).json({ error: 'merchant not found' });
+        return;
+      }
+      res.json(enrichment);
     } catch (err) {
       next(err);
     }
