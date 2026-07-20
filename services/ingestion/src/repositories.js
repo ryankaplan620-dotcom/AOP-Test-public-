@@ -1277,6 +1277,74 @@ export async function getLiftReport(db, { windowDays, halfDays, merchantId = nul
 }
 
 // ---------------------------------------------------------------------------
+// Dead-letter telemetry (migration 0016) — records that exhausted queue
+// retries, preserved for inspection instead of silently lost.
+// ---------------------------------------------------------------------------
+
+/**
+ * Batch-insert dead-lettered records (routes/telemetry.js /ingest/dead-
+ * letters, fed by the edge DLQ consumer). Records arrive pre-sanitized
+ * (U+0000 stripped by the route); each is stored verbatim as jsonb.
+ *
+ * @param {object} db
+ * @param {Array<object>} records
+ * @param {string} reason bounded to the column width by the route
+ * @returns {Promise<{stored: number}>}
+ */
+export async function insertDeadLetters(db, records, reason) {
+  if (!Array.isArray(records) || records.length === 0) return { stored: 0 };
+  const values = [];
+  const params = [];
+  let p = 1;
+  for (const record of records) {
+    values.push(`($${p}, $${p + 1})`);
+    params.push(reason, JSON.stringify(record));
+    p += 2;
+  }
+  const result = await db.query(
+    `INSERT INTO dead_letter_telemetry (reason, record) VALUES ${values.join(', ')} RETURNING id`,
+    params
+  );
+  return { stored: result.rows.length };
+}
+
+/**
+ * Recent dead-letter count for the platform summary/alert banner.
+ *
+ * @returns {Promise<number>}
+ */
+export async function getDeadLetterCount(db, { windowDays }) {
+  const result = await db.query(
+    `SELECT count(*)::bigint AS n FROM dead_letter_telemetry
+      WHERE received_at >= now() - make_interval(days => $1)`,
+    [windowDays]
+  );
+  return Number(result.rows[0]?.n ?? 0);
+}
+
+/**
+ * Retention purge for dead letters (jobs/retention-sweep.js): preserved
+ * evidence follows the same RETENTION_DAYS bound as intent telemetry.
+ * Single bounded batch per call — the caller loops, mirroring
+ * purge_expired_telemetry's contract.
+ *
+ * @returns {Promise<{deleted: number}>}
+ */
+export async function deleteExpiredDeadLetters(db, { retentionDays, limit }) {
+  const result = await db.query(
+    `DELETE FROM dead_letter_telemetry
+      WHERE id IN (
+        SELECT id FROM dead_letter_telemetry
+         WHERE received_at < now() - make_interval(days => $1)
+         ORDER BY id
+         LIMIT $2)
+      RETURNING id`,
+    [retentionDays, limit]
+  );
+  return { deleted: result.rows.length };
+}
+
+// ---------------------------------------------------------------------------
 // Merchant API keys (migration 0014) — multi-tenant /analytics auth.
 // Plaintext keys NEVER reach this module: routes hash first (lib/api-keys.js)
 // and only the SHA-256 hex digest crosses this boundary.

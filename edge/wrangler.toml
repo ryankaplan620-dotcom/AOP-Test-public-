@@ -52,6 +52,24 @@ retry_delay = 30
 dead_letter_queue = "aop-edge-telemetry-dlq"
 
 # -----------------------------------------------------------------------------
+# DLQ consumer (PR13): the SAME worker also drains the dead-letter queue. The
+# queue() handler routes *-dlq batches to POST /ingest/dead-letters, which
+# PRESERVES the raw records in PostgreSQL (dead_letter_telemetry, surfaced as
+# a platform ops alert) instead of losing them. Long retry_delay: these
+# records already survived 5 telemetry retries; the only thing that stops a
+# preservation POST is an ingest outage, so back off hard and keep trying —
+# there is deliberately NO dead_letter_queue here (a DLQ of the DLQ would
+# recurse; after max_retries Queues drops the batch, which is the same
+# outcome as not having this consumer at all, so preservation is pure upside).
+# -----------------------------------------------------------------------------
+[[queues.consumers]]
+queue = "aop-edge-telemetry-dlq"
+max_batch_size = 100
+max_batch_timeout = 30
+max_retries = 10
+retry_delay = 120
+
+# -----------------------------------------------------------------------------
 # Plain-text configuration vars (readable in the dashboard; NOT for secrets).
 # -----------------------------------------------------------------------------
 [vars]

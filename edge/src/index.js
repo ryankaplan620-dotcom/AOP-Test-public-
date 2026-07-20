@@ -458,9 +458,17 @@ export default {
       if (body !== undefined && body !== null) records.push(body);
     }
 
+    // DLQ drain (PR13): batches on the dead-letter queue exhausted every
+    // ingest retry. They are NOT retried into /ingest/telemetry again —
+    // that path already failed 5 times — they are PRESERVED via
+    // /ingest/dead-letters so operators can inspect/replay. Routed by queue
+    // name: any *-dlq queue is a dead-letter batch.
+    const isDeadLetterBatch = typeof batch?.queue === 'string' && batch.queue.endsWith('-dlq');
+    const drainPath = isDeadLetterBatch ? '/ingest/dead-letters' : '/ingest/telemetry';
+
     let payload;
     try {
-      payload = JSON.stringify({ records });
+      payload = JSON.stringify(isDeadLetterBatch ? { records, reason: 'edge_dlq' } : { records });
     } catch (err) {
       // Unserializable batch (should be impossible — queue messages are
       // structured-clone round-tripped) is poison by definition: drop it
@@ -472,7 +480,7 @@ export default {
 
     // Trailing-slash tolerance so "https://ingest.aop.network/" in config
     // doesn't produce a "//ingest/telemetry" path.
-    const endpoint = `${base.replace(/\/+$/, '')}/ingest/telemetry`;
+    const endpoint = `${base.replace(/\/+$/, '')}${drainPath}`;
     const headers = { 'content-type': 'application/json' };
     const token = env?.INGEST_API_TOKEN;
     if (typeof token === 'string' && token !== '') {

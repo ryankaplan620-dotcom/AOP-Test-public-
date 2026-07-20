@@ -25,6 +25,7 @@ import { createDbPool } from './db.js';
 import { buildApp } from './app.js';
 import { startLossSweep } from './jobs/loss-sweep.js';
 import { startRetentionSweep } from './jobs/retention-sweep.js';
+import { startDigestJob } from './jobs/digest.js';
 import { createLogger } from './lib/logger.js';
 
 const logger = createLogger('ingestion');
@@ -73,6 +74,8 @@ async function main() {
   const sweep = startLossSweep({ db, config, logger: logger.child('loss-sweep') });
   // Compliance retention: enforce the 90-day telemetry cap in-process.
   const retention = startRetentionSweep({ db, config, logger: logger.child('retention') });
+  // Weekly digest delivery (no-op when DIGEST_WEBHOOK_URL is unset).
+  const digest = startDigestJob({ db, config, logger: logger.child('digest') });
 
   // ---- 5. graceful shutdown ----------------------------------------------
   let shuttingDown = false;
@@ -94,6 +97,7 @@ async function main() {
       // (a) stop generating DB work; awaits any in-flight sweep passes.
       await sweep.stop();
       await retention.stop();
+      await digest.stop();
 
       // (b) stop accepting connections; resolves when in-flight requests end.
       await new Promise((resolve) => {

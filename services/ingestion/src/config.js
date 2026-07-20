@@ -210,6 +210,28 @@ export function loadConfig(env = process.env) {
     }
   }
 
+  // --- weekly digest delivery (optional feature) --------------------------
+  // DIGEST_WEBHOOK_URL: where jobs/digest.js POSTs the weekly platform
+  // digest (operator wires it to email/Slack/Zapier). Unset = job off.
+  let digestWebhookUrl = null;
+  const digestRaw = env.DIGEST_WEBHOOK_URL;
+  if (digestRaw !== undefined && digestRaw !== null && String(digestRaw).trim() !== '') {
+    const candidate = String(digestRaw).trim();
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('bad protocol');
+      digestWebhookUrl = candidate;
+    } catch {
+      problems.push(`DIGEST_WEBHOOK_URL="${digestRaw}" is invalid — expected an http(s) URL`);
+    }
+  }
+  // Send cadence. Default weekly; floor 1h (sub-hourly "weekly digests" are
+  // a misconfiguration, not a cadence).
+  const digestIntervalMs = parsePositiveInt(env, 'DIGEST_INTERVAL_MS', 7 * 24 * 3600 * 1000, problems, {
+    min: 3600000,
+    max: 90 * 24 * 3600 * 1000,
+  });
+
   if (problems.length > 0) {
     throw new ConfigError(
       'AOP ingestion service refused to start — configuration problems:\n' +
@@ -234,5 +256,8 @@ export function loadConfig(env = process.env) {
     shopifyOauth,
     // null when unset: OAuth installs leave proxy_hostname NULL.
     proxyHostnameSuffix,
+    // null when unset: the weekly digest job never starts.
+    digestWebhookUrl,
+    digestIntervalMs,
   };
 }

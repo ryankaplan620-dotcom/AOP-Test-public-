@@ -80,7 +80,7 @@ function isPlainObject(value) {
  * making it storable. Depth-bounded and cycle-safe by construction
  * (JSON.parse output only).
  */
-function stripNulCharacters(value, depth = 0) {
+export function stripNulCharacters(value, depth = 0) {
   if (typeof value === 'string') {
     return value.includes('\u0000') ? value.split('\u0000').join('') : value;
   }

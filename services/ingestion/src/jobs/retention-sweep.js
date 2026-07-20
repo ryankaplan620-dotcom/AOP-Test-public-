@@ -28,6 +28,8 @@
  * @returns {{stop: () => Promise<void>, runOnce: () => Promise<object>}}
  */
 
+import { deleteExpiredDeadLetters } from '../repositories.js';
+
 /** Rows deleted per inner purge transaction (see purge_expired_telemetry). */
 const PURGE_BATCH_SIZE = 10_000;
 
@@ -48,7 +50,7 @@ export function startRetentionSweep({ db, config, logger }) {
       : async (fn) => ({ ran: true, result: await fn() });
 
   async function purgePass() {
-    const summary = { intents_deleted: 0, batches: 0, failed: false };
+    const summary = { intents_deleted: 0, dead_letters_deleted: 0, batches: 0, failed: false };
     // The SQL function deletes ONE ctid-batch per call (migration 0012) and
     // THIS loop drains the backlog: every iteration is its own statement /
     // transaction, so no backlog size can ever hit statement_timeout, and
@@ -67,9 +69,21 @@ export function startRetentionSweep({ db, config, logger }) {
         summary.batches += 1;
         if (deleted < PURGE_BATCH_SIZE) break; // backlog drained
       }
-      if (summary.intents_deleted > 0) {
+      // Dead letters (migration 0016) follow the same retention bound —
+      // preserved evidence, not a second archive. Same bounded-batch loop.
+      for (;;) {
+        if (stopped) break;
+        const { deleted } = await deleteExpiredDeadLetters(db, {
+          retentionDays: config.retentionDays,
+          limit: PURGE_BATCH_SIZE,
+        });
+        summary.dead_letters_deleted += deleted;
+        if (deleted < PURGE_BATCH_SIZE) break;
+      }
+      if (summary.intents_deleted > 0 || summary.dead_letters_deleted > 0) {
         logger.info('retention purge completed', {
           intents_deleted: summary.intents_deleted,
+          dead_letters_deleted: summary.dead_letters_deleted,
           batches: summary.batches,
           retention_days: config.retentionDays,
         });

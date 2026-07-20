@@ -265,7 +265,35 @@ any merchant's HTML. Merchants pinned via the static `MERCHANT_ROUTES` worker
 config (a redeploy-time escape hatch that bypasses the database) are not
 enriched.
 
-## 11. Score a store policy
+## 11. Weekly digest, CSV export, dead-letter alerting
+
+```bash
+# On-demand digest (platform-wide with the ops alert; a merchant API key
+# gets their tenant's digest):
+curl -s http://localhost:8787/analytics/digest \
+  -H "Authorization: Bearer $DASHBOARD_API_TOKEN"
+
+# Spreadsheet-ready exports (RFC 4180 + formula-injection guarded):
+curl -sO -J http://localhost:8787/analytics/export/activity.csv?limit=500 \
+  -H "Authorization: Bearer $DASHBOARD_API_TOKEN"
+curl -sO -J "http://localhost:8787/analytics/export/billing.csv?month=$(date -u +%Y-%m)" \
+  -H "Authorization: Bearer $DASHBOARD_API_TOKEN"
+```
+
+Set `DIGEST_WEBHOOK_URL` (plus optional `DIGEST_INTERVAL_MS`, default weekly)
+when starting the ingestion service and jobs/digest.js POSTs the platform
+digest there on cadence — wire the webhook to email/Slack/Zapier. Delivery is
+watermarked in `sweep_state` (advisory-locked, survives restarts, only
+advances on a 2xx) so replicas and redeploys never double-send.
+
+Dead letters: telemetry batches that exhaust all queue retries land on
+`aop-edge-telemetry-dlq`; the SAME worker drains that queue into
+`POST /ingest/dead-letters`, preserving raw records in
+`dead_letter_telemetry` (retention-purged with everything else). The platform
+`/analytics/summary` carries a `dead_letters` count (null for merchant
+credentials) and the weekly digest flags it as an ALERT line.
+
+## 12. Score a store policy
 
 ```bash
 cd optimizer

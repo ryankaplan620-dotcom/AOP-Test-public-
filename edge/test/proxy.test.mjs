@@ -503,6 +503,36 @@ it('queue() POSTs the batch to INGEST_API_URL/ingest/telemetry with auth and ack
   assert.equal(state.retryAllCalls, 0);
 });
 
+it('queue() routes DLQ batches to /ingest/dead-letters with the edge_dlq reason (PR13)', async () => {
+  const env = makeEnv(undefined, { INGEST_API_URL: 'https://ingest.example.com' });
+  const records = [{ token: 'tok_poison', path: '/availability', status: 502 }];
+  const { batch, state } = makeBatch(records);
+  batch.queue = 'aop-edge-telemetry-dlq'; // Queues stamps the source queue name
+
+  const calls = installMockOrigin(() => new Response('{"stored":1}', { status: 200 }));
+  await worker.queue(batch, env);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].input, 'https://ingest.example.com/ingest/dead-letters');
+  assert.deepEqual(JSON.parse(calls[0].init.body), { records, reason: 'edge_dlq' });
+  assert.equal(state.ackAllCalls, 1, 'preserved batch acked');
+  assert.equal(state.retryAllCalls, 0);
+});
+
+it('queue() retries a DLQ batch when preservation fails (never re-posts to /ingest/telemetry)', async () => {
+  const env = makeEnv(undefined, { INGEST_API_URL: 'https://ingest.example.com' });
+  const { batch, state } = makeBatch([{ token: 'tok_poison' }]);
+  batch.queue = 'aop-edge-telemetry-dlq';
+
+  const calls = installMockOrigin(() => new Response('down', { status: 503 }));
+  await worker.queue(batch, env);
+
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].input.endsWith('/ingest/dead-letters'), 'DLQ batches never go back to /ingest/telemetry');
+  assert.equal(state.retryAllCalls, 1, 'preservation retried');
+  assert.equal(state.ackAllCalls, 0);
+});
+
 it('queue() retries the batch when the ingest service returns non-2xx', async () => {
   const env = makeEnv(undefined);
   const { batch, state } = makeBatch([{ token: 'tok_x' }]);
