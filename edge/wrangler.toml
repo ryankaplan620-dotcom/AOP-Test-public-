@@ -52,6 +52,32 @@ retry_delay = 30
 dead_letter_queue = "aop-edge-telemetry-dlq"
 
 # -----------------------------------------------------------------------------
+# DLQ consumer (PR13): the SAME worker also drains the dead-letter queue. The
+# queue() handler routes *-dlq batches to POST /ingest/dead-letters, which
+# PRESERVES the raw records in PostgreSQL (dead_letter_telemetry, surfaced as
+# a platform ops alert) instead of losing them.
+#
+# There is deliberately NO dead_letter_queue here (a DLQ of the DLQ would
+# recurse) — which means exhausting max_retries LOSES the batch for good.
+# Two design consequences:
+#   - /ingest/dead-letters is TOTAL over record content (per-record sentinel
+#     fallback in insertDeadLetters): no payload can make it 5xx, so the only
+#     thing that exhausts these retries is a genuinely down ingest service.
+#   - The retry budget is sized for a LONG outage, not a blip: 100 retries x
+#     600s ≈ 16h40m of continuous outage before anything is dropped (the
+#     consumer passes the same 600s explicitly via retryAll — an explicit
+#     delaySeconds overrides retry_delay, so the two MUST stay in sync; see
+#     DLQ_RETRY_DELAY_SECONDS in src/index.js). Redelivery after a lost 2xx
+#     cannot duplicate rows: records carry "<queue>:<message id>" dedupe keys.
+# -----------------------------------------------------------------------------
+[[queues.consumers]]
+queue = "aop-edge-telemetry-dlq"
+max_batch_size = 100
+max_batch_timeout = 30
+max_retries = 100
+retry_delay = 600
+
+# -----------------------------------------------------------------------------
 # Plain-text configuration vars (readable in the dashboard; NOT for secrets).
 # -----------------------------------------------------------------------------
 [vars]

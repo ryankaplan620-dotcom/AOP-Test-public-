@@ -12,7 +12,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { validateTelemetryRecord, ALLOWED_METHODS } from '../src/lib/validate-telemetry.js';
+import { validateTelemetryRecord, ALLOWED_METHODS, stripNulCharacters } from '../src/lib/validate-telemetry.js';
 
 /** A fully-populated, healthy wire record as the edge worker emits it. */
 function wireRecord(overrides = {}) {
@@ -280,4 +280,46 @@ test('malformed event_id degrades to null instead of rejecting shipped telemetry
     assert.equal(verdict.ok, true, `record with event_id=${JSON.stringify(bad)} must still ingest`);
     assert.equal(verdict.value.eventId, null);
   }
+});
+test('stripNulCharacters scrubs jsonb-fatal content: NUL removed, lone surrogates -> U+FFFD', () => {
+  // PG jsonb rejects \u0000 (22P05) AND unpaired surrogates (22P02); one
+  // such value in one record aborts the whole multi-row batch INSERT. The
+  // main ingest path (validateTelemetryRecord) and the dead-letter drain
+  // both rely on this scrub — this is what keeps a hostile agent payload
+  // from 500ing /ingest/telemetry, dead-lettering, and then poisoning the
+  // preservation endpoint identically.
+  assert.equal(stripNulCharacters('a\u0000b'), 'ab');
+  assert.equal(stripNulCharacters('a\ud800b'), 'a\ufffdb'); // lone high surrogate
+  assert.equal(stripNulCharacters('a\udc00b'), 'a\ufffdb'); // lone low surrogate
+  assert.equal(stripNulCharacters('tail\ud800'), 'tail\ufffd'); // string-final high surrogate
+  assert.equal(stripNulCharacters('\ud83d\ude00'), '\ud83d\ude00'); // proper pair untouched
+  assert.equal(stripNulCharacters('\ud83d\ude00\udc00'), '\ud83d\ude00\ufffd'); // pair kept, stray low scrubbed
+  assert.deepEqual(stripNulCharacters({ ['k\ud800']: ['v\u0000'] }), { ['k\ufffd']: ['v'] });
+});
+
+test('the 2048-unit query slice cannot bisect an astral pair back into a lone surrogate', () => {
+  // The record-wide scrub runs FIRST; buildEdgeMeta's bound on query runs
+  // after — cutting at a code-unit boundary would otherwise re-introduce
+  // exactly the lone surrogate that 22P02s the jsonb batch INSERT.
+  const emoji = '😀'; // U+1F600: one astral pair, two code units
+  const verdict = validateTelemetryRecord(
+    wireRecord({ query: 'a'.repeat(2047) + emoji + 'tail' })
+  );
+  assert.equal(verdict.ok, true);
+  const sliced = verdict.value.payload._edge.query;
+  assert.equal(sliced.length, 2048);
+  assert.equal(sliced.charCodeAt(2047), 0xfffd, 'bisected pair must become U+FFFD, not a lone surrogate');
+  // Whole-record round trip must be jsonb-representable JSON.
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(sliced));
+  // A pair that lands INSIDE the bound survives intact.
+  const inside = validateTelemetryRecord(wireRecord({ query: emoji + 'rest' }));
+  assert.equal(inside.value.payload._edge.query.slice(0, 2), emoji);
+});
+
+test('validateTelemetryRecord scrubs lone surrogates from the stored payload (ingest hot path)', () => {
+  const verdict = validateTelemetryRecord(
+    wireRecord({ inbound_payload: { note: 'x\ud800y' } })
+  );
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.value.payload.note, 'x\ufffdy');
 });

@@ -54,6 +54,8 @@ import express from 'express';
 import { timingSafeTokenCheck } from '../lib/auth.js';
 import { isApiKeyShaped, hashApiKey, generateApiKey } from '../lib/api-keys.js';
 import { parseWindowDays, parseLimit, percentShare, parseBillingMonth } from '../lib/analytics-params.js';
+import { toCsv } from '../lib/csv.js';
+import { buildDigest } from '../lib/digest.js';
 import {
   getAnalyticsSummary,
   getLossReasonBreakdown,
@@ -63,6 +65,7 @@ import {
   getBillingStatement,
   getPriceBenchmark,
   getLiftReport,
+  getDeadLetterCount,
   findMerchantByShopDomain,
   findMerchantByApiKeyHash,
   insertMerchantApiKey,
@@ -165,9 +168,13 @@ export function buildAnalyticsRouter({ config, db, logger }) {
     try {
       const windowDays = parseWindowDays(req.query.days);
       const merchantId = req.aopAuth.merchantId;
-      const [summary, phases] = await Promise.all([
+      const [summary, phases, deadLetters] = await Promise.all([
         getAnalyticsSummary(db, { windowDays, merchantId }),
         getLossPhaseBreakdown(db, { windowDays, merchantId }),
+        // Operational alert, PLATFORM view only: dead letters carry no
+        // reliable merchant attribution (they failed ingestion), so a
+        // tenant-scoped summary reports null, never a misleading 0.
+        merchantId === null ? getDeadLetterCount(db, { windowDays }) : Promise.resolve(null),
       ]);
 
       // Agent Conversion Rate: reconciled orders per intent impression —
@@ -189,6 +196,9 @@ export function buildAnalyticsRouter({ config, db, logger }) {
         adjustments: summary.adjustments,
         conversion_rate_pct: conversionRatePct,
         losses: summary.losses,
+        // Platform-only ops alert (null for merchant credentials): telemetry
+        // batches that exhausted queue retries in this window (PR13 DLQ).
+        dead_letters: deadLetters,
         // Heuristic cents from agent payloads — no currency evidence; render
         // unlabeled, never with a currency symbol.
         estimated_losses: summary.estimated_losses,
@@ -414,6 +424,76 @@ export function buildAnalyticsRouter({ config, db, logger }) {
           }))
           .sort((a, b) => a.delta - b.delta),
       });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- GET /analytics/digest -----------------------------------------------
+  // The weekly digest, on demand: platform credential -> platform-wide
+  // (with the dead-letter ops alert); merchant key -> that tenant only.
+  // jobs/digest.js POSTs this same object to DIGEST_WEBHOOK_URL weekly.
+  router.get('/digest', async (req, res, next) => {
+    try {
+      const digest = await buildDigest(db, {
+        merchantId: req.aopAuth.merchantId,
+        scopeLabel: req.aopAuth.shopDomain ?? undefined,
+      });
+      res.json(digest);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- CSV exports (tenant-scoped like every read) -------------------------
+  // Spreadsheet-ready downloads: RFC 4180 quoting + formula-injection guard
+  // (lib/csv.js). Content-Disposition so browsers save instead of render.
+
+  // GET /analytics/export/activity.csv?limit=500
+  router.get('/export/activity.csv', async (req, res, next) => {
+    try {
+      const limit = parseLimit(req.query.limit);
+      const events = await getRecentActivity(db, { limit, merchantId: req.aopAuth.merchantId });
+      const csv = toCsv(events, [
+        { key: 'occurred_at', header: 'occurred_at' },
+        { key: 'outcome', header: 'outcome' },
+        { key: 'protocol', header: 'protocol' },
+        { key: 'target_sku', header: 'target_sku' },
+        { key: 'detail', header: 'detail' },
+        { key: 'amount', header: 'amount' },
+        { key: 'currency', header: 'currency' },
+      ]);
+      res.set('content-type', 'text/csv; charset=utf-8');
+      res.set('content-disposition', 'attachment; filename="aop-activity.csv"');
+      res.send(csv);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // GET /analytics/export/billing.csv?month=YYYY-MM
+  router.get('/export/billing.csv', async (req, res, next) => {
+    try {
+      const { label, startDate } = parseBillingMonth(req.query.month);
+      const lines = await getBillingStatement(db, {
+        monthStartDate: startDate,
+        merchantId: req.aopAuth.merchantId,
+      });
+      const csv = toCsv(lines, [
+        { key: 'shop_domain', header: 'shop_domain' },
+        { key: 'currency', header: 'currency' },
+        { key: 'orders', header: 'orders' },
+        { key: 'gmv', header: 'gmv' },
+        { key: 'commission', header: 'commission' },
+        { key: 'adjustments', header: 'adjustments' },
+        { key: 'adjusted_gmv', header: 'adjusted_gmv' },
+        { key: 'commission_credits', header: 'commission_credits' },
+        { key: 'net_gmv', header: 'net_gmv' },
+        { key: 'net_commission', header: 'net_commission' },
+      ]);
+      res.set('content-type', 'text/csv; charset=utf-8');
+      res.set('content-disposition', `attachment; filename="aop-billing-${label}.csv"`);
+      res.send(csv);
     } catch (err) {
       next(err);
     }

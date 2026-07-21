@@ -23,8 +23,8 @@
 
 import express from 'express';
 import { timingSafeTokenCheck } from '../lib/auth.js';
-import { validateTelemetryRecord } from '../lib/validate-telemetry.js';
-import { findMerchantForTelemetry, insertIntentLogsBatch } from '../repositories.js';
+import { validateTelemetryRecord, stripNulCharacters } from '../lib/validate-telemetry.js';
+import { findMerchantForTelemetry, insertIntentLogsBatch, insertDeadLetters } from '../repositories.js';
 
 /** Hard ceiling on records per POST — beyond this the caller must split. */
 export const MAX_RECORDS_PER_BATCH = 500;
@@ -100,6 +100,85 @@ export function buildTelemetryRouter({ config, db, logger }) {
     merchantCache.set(key, merchant);
     return merchant;
   }
+
+  // POST /ingest/dead-letters — the edge DLQ consumer's drain (PR13).
+  // Records here EXHAUSTED every queue retry; the contract is preservation,
+  // not validation: store the raw record verbatim (NUL-stripped for jsonb)
+  // so operators can inspect/replay instead of losing telemetry silently.
+  // Same bearer as /telemetry (one edge trust domain); same batch cap.
+  router.post('/dead-letters', async (req, res, next) => {
+    try {
+      const authHeader = req.get('authorization') ?? '';
+      const match = /^Bearer\s+(.+)$/i.exec(authHeader);
+      const presented = match ? match[1].trim() : null;
+      if (!timingSafeTokenCheck(presented, config.ingestApiToken)) {
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+      }
+
+      const body = req.body;
+      if (body === null || typeof body !== 'object' || !Array.isArray(body.records)) {
+        res.status(400).json({ error: 'body must be a JSON object with a records[] array' });
+        return;
+      }
+      if (body.records.length > MAX_RECORDS_PER_BATCH) {
+        res.status(413).json({
+          error: 'batch too large',
+          max_records: MAX_RECORDS_PER_BATCH,
+          received: body.records.length,
+        });
+        return;
+      }
+
+      // reason goes to PG as a raw text param, which rejects NUL (and would
+      // abort the whole batch) exactly like jsonb does — scrub it the same
+      // way as record content before bounding it to the column width.
+      const reasonRaw = typeof body.reason === 'string' ? stripNulCharacters(body.reason) : '';
+      const reason = reasonRaw.trim() !== '' ? reasonRaw.trim().slice(0, 120) : 'unknown';
+
+      // Optional caller-supplied per-record dedupe ids (the edge sends its
+      // queue message ids): at-least-once redelivery of a batch whose first
+      // preservation attempt timed out on the reply must not duplicate rows.
+      const ids = Array.isArray(body.ids) ? body.ids : [];
+
+      // Preserve every non-null record; stripNulCharacters fails closed
+      // (null) on hostile nesting depth — those slots are recorded as a
+      // sentinel rather than dropped without trace.
+      const sanitized = [];
+      const dedupeKeys = [];
+      for (let i = 0; i < body.records.length; i += 1) {
+        const record = body.records[i];
+        if (record === undefined || record === null) continue;
+        const clean = stripNulCharacters(record);
+        sanitized.push(clean === null ? { aop_unpreservable: true } : clean);
+        const id = ids[i];
+        dedupeKeys.push(
+          typeof id === 'string' && id.trim() !== ''
+            ? stripNulCharacters(id).slice(0, 256)
+            : null
+        );
+      }
+      if (sanitized.length === 0) {
+        res.json({ stored: 0 });
+        return;
+      }
+
+      const { stored } = await insertDeadLetters(db, sanitized, reason, dedupeKeys);
+      // warn (not info): dead letters mean the ingest pipeline dropped
+      // batches past all retries — an operator should notice. `deduped`
+      // makes a silent dedupe-key drop observable: >0 is normal on queue
+      // redelivery, but persistent non-zero without redelivery would mean
+      // colliding keys discarding content.
+      logger.warn('dead-lettered telemetry preserved', {
+        stored,
+        deduped: sanitized.length - stored,
+        reason,
+      });
+      res.json({ stored });
+    } catch (err) {
+      next(err);
+    }
+  });
 
   router.post('/telemetry', async (req, res, next) => {
     try {

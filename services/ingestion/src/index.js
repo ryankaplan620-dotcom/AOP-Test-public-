@@ -11,11 +11,12 @@
  *     4. start the loss-diagnostics sweep (src/jobs/loss-sweep.js),
  *     5. shut all of it down IN REVERSE ORDER on SIGTERM/SIGINT.
  *
- * Shutdown ordering rationale (reverse of startup, and it matters):
- *   sweep first (stop generating new DB work), then the HTTP server (stop
- *   accepting new requests while in-flight ones finish), then the pool
- *   (drain once nothing can need a connection). Draining the pool first
- *   would strand in-flight webhook requests mid-INSERT — exactly the kind of
+ * Shutdown ordering rationale:
+ *   jobs and the HTTP listener drain CONCURRENTLY (they only depend on the
+ *   pool, not on each other, and the watchdog budget is shared — one slow
+ *   drain must not starve the rest), then the pool last (drain once
+ *   nothing can need a connection). Draining the pool first would strand
+ *   in-flight webhook requests mid-INSERT — exactly the kind of
  *   half-processed order the ON CONFLICT idempotency exists to survive, but
  *   there is no reason to invoke it on every deploy.
  */
@@ -25,6 +26,7 @@ import { createDbPool } from './db.js';
 import { buildApp } from './app.js';
 import { startLossSweep } from './jobs/loss-sweep.js';
 import { startRetentionSweep } from './jobs/retention-sweep.js';
+import { startDigestJob } from './jobs/digest.js';
 import { createLogger } from './lib/logger.js';
 
 const logger = createLogger('ingestion');
@@ -73,6 +75,8 @@ async function main() {
   const sweep = startLossSweep({ db, config, logger: logger.child('loss-sweep') });
   // Compliance retention: enforce the 90-day telemetry cap in-process.
   const retention = startRetentionSweep({ db, config, logger: logger.child('retention') });
+  // Weekly digest delivery (no-op when DIGEST_WEBHOOK_URL is unset).
+  const digest = startDigestJob({ db, config, logger: logger.child('digest') });
 
   // ---- 5. graceful shutdown ----------------------------------------------
   let shuttingDown = false;
@@ -91,19 +95,25 @@ async function main() {
     watchdog.unref();
 
     try {
-      // (a) stop generating DB work; awaits any in-flight sweep passes.
-      await sweep.stop();
-      await retention.stop();
+      // (a) stop the jobs AND the HTTP listener concurrently: both only
+      // consume the pool, never each other, and serializing them would let
+      // one slow drain (a hung digest webhook, a wedged request) eat the
+      // entire watchdog budget before the other even starts. server.close()
+      // stops NEW connections the moment it is called; in-flight requests
+      // finish while the jobs drain alongside.
+      await Promise.all([
+        sweep.stop(),
+        retention.stop(),
+        digest.stop(),
+        new Promise((resolve) => {
+          server.close((err) => {
+            if (err) logger.warn('http server close reported an error', { err });
+            resolve();
+          });
+        }),
+      ]);
 
-      // (b) stop accepting connections; resolves when in-flight requests end.
-      await new Promise((resolve) => {
-        server.close((err) => {
-          if (err) logger.warn('http server close reported an error', { err });
-          resolve();
-        });
-      });
-
-      // (c) drain the pool last — nothing can need a connection anymore.
+      // (b) drain the pool last — nothing can need a connection anymore.
       await db.end();
 
       logger.info('shutdown complete');

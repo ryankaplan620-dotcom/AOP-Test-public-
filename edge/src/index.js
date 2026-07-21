@@ -194,16 +194,26 @@ function ackBatch(batch) {
 export const RETRY_DELAY_SECONDS = 30;
 
 /**
+ * DLQ-drain backoff (keep in sync with the aop-edge-telemetry-dlq consumer
+ * in wrangler.toml). Preservation POSTs only fail on ingest outage, and
+ * exhausting the DLQ's retries LOSES the records for good — so the drain
+ * backs off much harder than the hot path. An explicit retryAll delay
+ * OVERRIDES the consumer's configured retry_delay, so passing the hot-path
+ * 30s here would silently shrink the preservation window ~20x.
+ */
+export const DLQ_RETRY_DELAY_SECONDS = 600;
+
+/**
  * Ask Queues to redeliver the whole batch: prefer batch.retryAll() with an
  * explicit delay; otherwise throw so the runtime marks the invocation failed
  * (same redelivery effect, runtime-default backoff). Redelivery +
  * max_retries + the DLQ (see wrangler.toml) is what shields the pipeline
  * from poison messages.
  */
-function retryBatch(batch, reason) {
+function retryBatch(batch, reason, delaySeconds = RETRY_DELAY_SECONDS) {
   if (typeof batch?.retryAll === 'function') {
     try {
-      batch.retryAll({ delaySeconds: RETRY_DELAY_SECONDS });
+      batch.retryAll({ delaySeconds });
       return;
     } catch {
       /* older runtime without options support — try the bare form */
@@ -452,15 +462,37 @@ export default {
 
     // Message bodies ARE the telemetry records pushed by fetch(); tolerate the
     // occasional null/undefined body without failing the whole batch.
+    // ids stay index-aligned with records (dead-letter dedupe, below).
     const records = [];
+    const ids = [];
     for (const message of messages) {
       const body = message?.body;
-      if (body !== undefined && body !== null) records.push(body);
+      if (body === undefined || body === null) continue;
+      records.push(body);
+      ids.push(typeof message?.id === 'string' && message.id !== '' ? message.id : null);
     }
+
+    // DLQ drain (PR13): batches on the dead-letter queue exhausted every
+    // ingest retry. They are NOT retried into /ingest/telemetry again —
+    // that path already failed 5 times — they are PRESERVED via
+    // /ingest/dead-letters so operators can inspect/replay. Routed by queue
+    // name: any *-dlq queue is a dead-letter batch. ids carry
+    // "<queue>:<message id>" so an at-least-once redelivery (preservation
+    // succeeded but the 200 got lost) cannot store every record twice.
+    const isDeadLetterBatch = typeof batch?.queue === 'string' && batch.queue.endsWith('-dlq');
+    const drainPath = isDeadLetterBatch ? '/ingest/dead-letters' : '/ingest/telemetry';
 
     let payload;
     try {
-      payload = JSON.stringify({ records });
+      payload = JSON.stringify(
+        isDeadLetterBatch
+          ? {
+              records,
+              reason: 'edge_dlq',
+              ids: ids.map((id) => (id === null ? null : `${batch.queue}:${id}`)),
+            }
+          : { records }
+      );
     } catch (err) {
       // Unserializable batch (should be impossible — queue messages are
       // structured-clone round-tripped) is poison by definition: drop it
@@ -472,7 +504,7 @@ export default {
 
     // Trailing-slash tolerance so "https://ingest.aop.network/" in config
     // doesn't produce a "//ingest/telemetry" path.
-    const endpoint = `${base.replace(/\/+$/, '')}/ingest/telemetry`;
+    const endpoint = `${base.replace(/\/+$/, '')}${drainPath}`;
     const headers = { 'content-type': 'application/json' };
     const token = env?.INGEST_API_TOKEN;
     if (typeof token === 'string' && token !== '') {
@@ -480,6 +512,8 @@ export default {
     }
     // Missing token is NOT dropped client-side: the ingest service owns auth
     // policy; a 401 response will flow through the normal retry/DLQ path.
+
+    const retryDelay = isDeadLetterBatch ? DLQ_RETRY_DELAY_SECONDS : RETRY_DELAY_SECONDS;
 
     let response;
     try {
@@ -491,7 +525,7 @@ export default {
       });
     } catch (err) {
       console.error('AOP edge queue: ingest POST failed, retrying batch:', err?.message ?? err);
-      retryBatch(batch, err);
+      retryBatch(batch, err, retryDelay);
       return;
     }
 
@@ -509,6 +543,6 @@ export default {
     }
 
     console.error(`AOP edge queue: ingest service responded ${response.status}; retrying batch`);
-    retryBatch(batch, new Error(`AOP ingest service responded ${response.status}`));
+    retryBatch(batch, new Error(`AOP ingest service responded ${response.status}`), retryDelay);
   },
 };

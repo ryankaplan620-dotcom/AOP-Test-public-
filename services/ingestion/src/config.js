@@ -210,6 +210,45 @@ export function loadConfig(env = process.env) {
     }
   }
 
+  // --- weekly digest delivery (optional feature) --------------------------
+  // DIGEST_WEBHOOK_URL: where jobs/digest.js POSTs the weekly platform
+  // digest (operator wires it to email/Slack/Zapier). Unset = job off.
+  let digestWebhookUrl = null;
+  const digestRaw = env.DIGEST_WEBHOOK_URL;
+  if (digestRaw !== undefined && digestRaw !== null && String(digestRaw).trim() !== '') {
+    const candidate = String(digestRaw).trim();
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('bad protocol');
+      if (parsed.username !== '' || parsed.password !== '') {
+        // fetch() (undici) rejects credentialed URLs unconditionally at
+        // request time — accepting one here would boot fine and then fail
+        // (and log the secret) on every delivery attempt, forever. Fail at
+        // boot instead, WITHOUT echoing the URL: it contains the secret.
+        problems.push(
+          'DIGEST_WEBHOOK_URL must not embed credentials (user:pass@) — ' +
+            'fetch() rejects such URLs; authenticate via a token in the path or a receiving bridge'
+        );
+      } else {
+        digestWebhookUrl = candidate;
+      }
+    } catch {
+      // Not echoed either: a MALFORMED value can still embed credentials
+      // (e.g. "http://user:pass@" with a typo'd host) and this message
+      // lands in deploy logs. Withholding the value costs a little
+      // debuggability; leaking a webhook password costs more.
+      problems.push(
+        'DIGEST_WEBHOOK_URL is invalid — expected an http(s) URL (value withheld from logs in case it embeds credentials)'
+      );
+    }
+  }
+  // Send cadence. Default weekly; floor 1h (sub-hourly "weekly digests" are
+  // a misconfiguration, not a cadence).
+  const digestIntervalMs = parsePositiveInt(env, 'DIGEST_INTERVAL_MS', 7 * 24 * 3600 * 1000, problems, {
+    min: 3600000,
+    max: 90 * 24 * 3600 * 1000,
+  });
+
   if (problems.length > 0) {
     throw new ConfigError(
       'AOP ingestion service refused to start — configuration problems:\n' +
@@ -234,5 +273,8 @@ export function loadConfig(env = process.env) {
     shopifyOauth,
     // null when unset: OAuth installs leave proxy_hostname NULL.
     proxyHostnameSuffix,
+    // null when unset: the weekly digest job never starts.
+    digestWebhookUrl,
+    digestIntervalMs,
   };
 }
