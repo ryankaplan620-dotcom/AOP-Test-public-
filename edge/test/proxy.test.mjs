@@ -18,7 +18,7 @@
 import { it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import worker from '../src/index.js';
+import worker, { RETRY_DELAY_SECONDS, DLQ_RETRY_DELAY_SECONDS } from '../src/index.js';
 import { resolveOrigin } from '../src/routing.js';
 
 // ---------------------------------------------------------------------------
@@ -460,7 +460,7 @@ it('resolveOrigin skips individually invalid route entries without poisoning val
 
 /** Queue batch stub with recording ack/retry spies. */
 function makeBatch(bodies, { withRetryAll = true } = {}) {
-  const state = { ackAllCalls: 0, retryAllCalls: 0, ackedIds: [] };
+  const state = { ackAllCalls: 0, retryAllCalls: 0, retryDelays: [], ackedIds: [] };
   const batch = {
     messages: bodies.map((body, i) => ({
       id: `msg-${i}`,
@@ -474,8 +474,9 @@ function makeBatch(bodies, { withRetryAll = true } = {}) {
     },
   };
   if (withRetryAll) {
-    batch.retryAll = () => {
+    batch.retryAll = (options) => {
       state.retryAllCalls += 1;
+      state.retryDelays.push(options?.delaySeconds ?? null);
     };
   }
   return { batch, state };
@@ -503,7 +504,7 @@ it('queue() POSTs the batch to INGEST_API_URL/ingest/telemetry with auth and ack
   assert.equal(state.retryAllCalls, 0);
 });
 
-it('queue() routes DLQ batches to /ingest/dead-letters with the edge_dlq reason (PR13)', async () => {
+it('queue() routes DLQ batches to /ingest/dead-letters with the edge_dlq reason and dedupe ids (PR13)', async () => {
   const env = makeEnv(undefined, { INGEST_API_URL: 'https://ingest.example.com' });
   const records = [{ token: 'tok_poison', path: '/availability', status: 502 }];
   const { batch, state } = makeBatch(records);
@@ -514,12 +515,18 @@ it('queue() routes DLQ batches to /ingest/dead-letters with the edge_dlq reason 
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].input, 'https://ingest.example.com/ingest/dead-letters');
-  assert.deepEqual(JSON.parse(calls[0].init.body), { records, reason: 'edge_dlq' });
+  // ids are "<queue>:<message id>" so at-least-once redelivery cannot
+  // double-store the records server-side.
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    records,
+    reason: 'edge_dlq',
+    ids: ['aop-edge-telemetry-dlq:msg-0'],
+  });
   assert.equal(state.ackAllCalls, 1, 'preserved batch acked');
   assert.equal(state.retryAllCalls, 0);
 });
 
-it('queue() retries a DLQ batch when preservation fails (never re-posts to /ingest/telemetry)', async () => {
+it('queue() retries a DLQ batch with the LONG preservation backoff when the drain fails (never re-posts to /ingest/telemetry)', async () => {
   const env = makeEnv(undefined, { INGEST_API_URL: 'https://ingest.example.com' });
   const { batch, state } = makeBatch([{ token: 'tok_poison' }]);
   batch.queue = 'aop-edge-telemetry-dlq';
@@ -530,7 +537,21 @@ it('queue() retries a DLQ batch when preservation fails (never re-posts to /inge
   assert.equal(calls.length, 1);
   assert.ok(calls[0].input.endsWith('/ingest/dead-letters'), 'DLQ batches never go back to /ingest/telemetry');
   assert.equal(state.retryAllCalls, 1, 'preservation retried');
+  // An explicit retryAll delay OVERRIDES wrangler.toml's retry_delay: the
+  // hot path's 30s here would shrink the DLQ's preservation window ~20x.
+  assert.deepEqual(state.retryDelays, [DLQ_RETRY_DELAY_SECONDS]);
   assert.equal(state.ackAllCalls, 0);
+});
+
+it('queue() retries normal telemetry batches with the short hot-path backoff', async () => {
+  const env = makeEnv(undefined, { INGEST_API_URL: 'https://ingest.example.com' });
+  const { batch, state } = makeBatch([{ token: 'tok_1' }]);
+
+  const calls = installMockOrigin(() => new Response('down', { status: 503 }));
+  await worker.queue(batch, env);
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(state.retryDelays, [RETRY_DELAY_SECONDS]);
 });
 
 it('queue() retries the batch when the ingest service returns non-2xx', async () => {

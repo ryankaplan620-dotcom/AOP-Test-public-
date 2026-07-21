@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import express from 'express';
 import { buildTelemetryRouter, MAX_RECORDS_PER_BATCH } from '../src/routes/telemetry.js';
 import { startDigestJob, DIGEST_JOB_NAME } from '../src/jobs/digest.js';
+import { insertDeadLetters } from '../src/repositories.js';
 
 const INGEST_TOKEN = 'tok-ingest-test';
 const silentLogger = { info() {}, warn() {}, error() {}, debug() {} };
@@ -60,7 +61,8 @@ async function post(baseUrl, body, token = INGEST_TOKEN) {
 
 const insertHit = [
   /INSERT INTO dead_letter_telemetry/,
-  (text, params) => ({ rows: params.filter((_, i) => i % 2 === 1).map((_, i) => ({ id: i + 1 })), rowCount: 1 }),
+  // Params are (reason, record, dedupe_key) triples; one row per record.
+  (text, params) => ({ rows: params.filter((_, i) => i % 3 === 1).map((_, i) => ({ id: i + 1 })), rowCount: 1 }),
 ];
 
 test('POST /ingest/dead-letters preserves records verbatim with the reason', async () => {
@@ -76,9 +78,13 @@ test('POST /ingest/dead-letters preserves records verbatim with the reason', asy
     assert.equal(r.body.stored, 2);
 
     const insert = db.statements.find((s) => /INSERT INTO dead_letter_telemetry/.test(s.text));
+    // At-least-once redelivery must not double-store: the arbiter is load-
+    // bearing, pin its presence in the SQL text.
+    assert.match(insert.text, /ON CONFLICT \(dedupe_key\) DO NOTHING/);
     assert.equal(insert.params[0], 'edge_dlq');
     assert.deepEqual(JSON.parse(insert.params[1]), records[0]); // verbatim
-    assert.deepEqual(JSON.parse(insert.params[3]), records[1]);
+    assert.equal(insert.params[2], null); // no ids sent -> no dedupe key
+    assert.deepEqual(JSON.parse(insert.params[4]), records[1]);
   } finally {
     await app.close();
   }
@@ -113,6 +119,105 @@ test('dead-letters sanitizes NUL and preserves unpreservable slots as sentinels'
   } finally {
     await app.close();
   }
+});
+
+test('dead-letters scrubs lone surrogates (jsonb rejects them like NUL) and NUL in reason', async () => {
+  const db = fakeDb([insertHit]);
+  const app = await startApp(db);
+  try {
+    // "\ud800" is legal JSON; PG jsonb rejects it with 22P02. The route
+    // must make it storable, not let it 500 the whole preserved batch.
+    const r = await post(app.url, {
+      records: [{ note: 'a\ud800b', ok: 'c\ud83d\ude00d' }],
+      reason: 'edge\u0000dlq',
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.stored, 1);
+    const insert = db.statements.find((s) => /INSERT INTO dead_letter_telemetry/.test(s.text));
+    assert.equal(insert.params[0], 'edgedlq'); // NUL stripped from reason too
+    const stored = JSON.parse(insert.params[1]);
+    assert.equal(stored.note, 'a\ufffdb'); // lone surrogate -> U+FFFD marker
+    assert.equal(stored.ok, 'c\ud83d\ude00d'); // proper pairs untouched
+  } finally {
+    await app.close();
+  }
+});
+
+test('dead-letters maps caller ids to dedupe keys, index-aligned across skipped null slots', async () => {
+  const db = fakeDb([insertHit]);
+  const app = await startApp(db);
+  try {
+    const r = await post(app.url, {
+      records: [{ a: 1 }, null, { b: 2 }],
+      ids: ['q:m0', 'q:m1', 'q:m2'],
+      reason: 'edge_dlq',
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.stored, 2);
+    const insert = db.statements.find((s) => /INSERT INTO dead_letter_telemetry/.test(s.text));
+    // Slot 1 was null (skipped) — record {b:2} must keep ITS id, not m1's.
+    assert.deepEqual(JSON.parse(insert.params[1]), { a: 1 });
+    assert.equal(insert.params[2], 'q:m0');
+    assert.deepEqual(JSON.parse(insert.params[4]), { b: 2 });
+    assert.equal(insert.params[5], 'q:m2');
+  } finally {
+    await app.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// insertDeadLetters totality: a jsonb-unstorable record must degrade to a
+// sentinel row, never abort the batch (the DLQ consumer has no DLQ of its
+// own — a permanently-500ing drain LOSES the batch after max_retries).
+// ---------------------------------------------------------------------------
+
+/** Fake db whose query() delegates to a scripted function. */
+function scriptedDb(fn) {
+  const statements = [];
+  return {
+    statements,
+    async query(text, params = []) {
+      statements.push({ text, params });
+      return fn(text, params, statements.length);
+    },
+  };
+}
+
+test('insertDeadLetters falls back to per-record inserts on a data exception, sentineling the unstorable record', async () => {
+  const records = [{ good: 1 }, { poison: true }, { good: 2 }];
+  const db = scriptedDb((text, params, n) => {
+    if (n === 1) {
+      // The multi-row batch INSERT aborts on the poison value.
+      const err = new Error('invalid input syntax for type json');
+      err.code = '22P02';
+      throw err;
+    }
+    // Per-record path: reject the poison record once, accept its sentinel.
+    if (JSON.parse(params[1]).poison === true) {
+      const err = new Error('invalid input syntax for type json');
+      err.code = '22P02';
+      throw err;
+    }
+    return { rows: [{ id: n }], rowCount: 1 };
+  });
+
+  const { stored } = await insertDeadLetters(db, records, 'edge_dlq', ['k0', 'k1', 'k2']);
+  assert.equal(stored, 3, 'both good records AND the sentinel stored');
+  // 1 batch attempt + 3 per-record + 1 sentinel retry = 5 statements.
+  assert.equal(db.statements.length, 5);
+  const sentinel = db.statements.find((s) => /aop_unpreservable/.test(s.params[1] ?? ''));
+  assert.ok(sentinel, 'sentinel row written for the unstorable record');
+  assert.equal(sentinel.params[2], 'k1', 'sentinel keeps the original dedupe key');
+});
+
+test('insertDeadLetters propagates infrastructure errors so the queue retries (never fake-succeeds)', async () => {
+  const db = scriptedDb(() => {
+    const err = new Error('connection terminated');
+    err.code = '57P01'; // admin_shutdown — NOT a data exception
+    throw err;
+  });
+  await assert.rejects(() => insertDeadLetters(db, [{ a: 1 }], 'edge_dlq'), /connection terminated/);
+  assert.equal(db.statements.length, 1, 'no per-record fallback on infra failure');
 });
 
 // ---------------------------------------------------------------------------

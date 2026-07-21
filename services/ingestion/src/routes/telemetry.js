@@ -130,26 +130,40 @@ export function buildTelemetryRouter({ config, db, logger }) {
         return;
       }
 
-      const reason =
-        typeof body.reason === 'string' && body.reason.trim() !== ''
-          ? body.reason.trim().slice(0, 120)
-          : 'unknown';
+      // reason goes to PG as a raw text param, which rejects NUL (and would
+      // abort the whole batch) exactly like jsonb does — scrub it the same
+      // way as record content before bounding it to the column width.
+      const reasonRaw = typeof body.reason === 'string' ? stripNulCharacters(body.reason) : '';
+      const reason = reasonRaw.trim() !== '' ? reasonRaw.trim().slice(0, 120) : 'unknown';
+
+      // Optional caller-supplied per-record dedupe ids (the edge sends its
+      // queue message ids): at-least-once redelivery of a batch whose first
+      // preservation attempt timed out on the reply must not duplicate rows.
+      const ids = Array.isArray(body.ids) ? body.ids : [];
 
       // Preserve every non-null record; stripNulCharacters fails closed
       // (null) on hostile nesting depth — those slots are recorded as a
       // sentinel rather than dropped without trace.
       const sanitized = [];
-      for (const record of body.records) {
+      const dedupeKeys = [];
+      for (let i = 0; i < body.records.length; i += 1) {
+        const record = body.records[i];
         if (record === undefined || record === null) continue;
         const clean = stripNulCharacters(record);
         sanitized.push(clean === null ? { aop_unpreservable: true } : clean);
+        const id = ids[i];
+        dedupeKeys.push(
+          typeof id === 'string' && id.trim() !== ''
+            ? stripNulCharacters(id).slice(0, 256)
+            : null
+        );
       }
       if (sanitized.length === 0) {
         res.json({ stored: 0 });
         return;
       }
 
-      const { stored } = await insertDeadLetters(db, sanitized, reason);
+      const { stored } = await insertDeadLetters(db, sanitized, reason, dedupeKeys);
       // warn (not info): dead letters mean the ingest pipeline dropped
       // batches past all retries — an operator should notice.
       logger.warn('dead-lettered telemetry preserved', { stored, reason });

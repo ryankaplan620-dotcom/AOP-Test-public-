@@ -289,9 +289,14 @@ advances on a 2xx) so replicas and redeploys never double-send.
 Dead letters: telemetry batches that exhaust all queue retries land on
 `aop-edge-telemetry-dlq`; the SAME worker drains that queue into
 `POST /ingest/dead-letters`, preserving raw records in
-`dead_letter_telemetry` (retention-purged with everything else). The platform
-`/analytics/summary` carries a `dead_letters` count (null for merchant
-credentials) and the weekly digest flags it as an ALERT line.
+`dead_letter_telemetry` (retention-purged with everything else). The
+endpoint is total over record content — jsonb-fatal strings (NUL, lone
+surrogates) are scrubbed, and a record PG still refuses degrades to an
+`aop_unpreservable` sentinel row instead of failing the batch — and
+idempotent under queue redelivery (each record carries a
+`<queue>:<message id>` dedupe key). The platform `/analytics/summary`
+carries a `dead_letters` count (null for merchant credentials) and the
+weekly digest flags it as an ALERT line.
 
 ## 12. Score a store policy
 

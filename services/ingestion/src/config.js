@@ -220,7 +220,18 @@ export function loadConfig(env = process.env) {
     try {
       const parsed = new URL(candidate);
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('bad protocol');
-      digestWebhookUrl = candidate;
+      if (parsed.username !== '' || parsed.password !== '') {
+        // fetch() (undici) rejects credentialed URLs unconditionally at
+        // request time — accepting one here would boot fine and then fail
+        // (and log the secret) on every delivery attempt, forever. Fail at
+        // boot instead, WITHOUT echoing the URL: it contains the secret.
+        problems.push(
+          'DIGEST_WEBHOOK_URL must not embed credentials (user:pass@) — ' +
+            'fetch() rejects such URLs; authenticate via a token in the path or a receiving bridge'
+        );
+      } else {
+        digestWebhookUrl = candidate;
+      }
     } catch {
       problems.push(`DIGEST_WEBHOOK_URL="${digestRaw}" is invalid — expected an http(s) URL`);
     }

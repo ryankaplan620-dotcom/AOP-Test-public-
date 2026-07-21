@@ -24,6 +24,16 @@
 const FORMULA_TRIGGERS = new Set(['=', '+', '-', '@', '\t', '\r']);
 
 /**
+ * A string that IS a plain decimal number (node-postgres returns NUMERIC
+ * and BIGINT columns as strings — "-129.00" is how every refund amount
+ * arrives here). Spreadsheets parse these as numbers, never as formulas,
+ * so the guard must not fire: an apostrophe would corrupt every negative
+ * money value in the export. Anchored and exact — "-2+3", "-@x" or
+ * " -1" all fail the match and stay guarded.
+ */
+const NUMERIC_STRING = /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;
+
+/**
  * Serialize one field. null/undefined -> empty; numbers/booleans verbatim;
  * strings guarded (formula prefix) then quoted (RFC 4180) when needed.
  *
@@ -36,7 +46,7 @@ export function csvField(value) {
   if (typeof value === 'boolean') return value ? 'true' : 'false';
 
   let text = value instanceof Date ? value.toISOString() : String(value);
-  if (text.length > 0 && FORMULA_TRIGGERS.has(text[0])) {
+  if (text.length > 0 && FORMULA_TRIGGERS.has(text[0]) && !NUMERIC_STRING.test(text)) {
     text = `'${text}`;
   }
   if (/[",\r\n]/.test(text)) {

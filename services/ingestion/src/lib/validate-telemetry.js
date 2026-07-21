@@ -70,19 +70,36 @@ function isPlainObject(value) {
 }
 
 /**
- * Strip U+0000 from every string in a JSON tree (keys and values).
+ * Unpaired UTF-16 surrogates: \uD800-\uDBFF with no low surrogate after,
+ * or \uDC00-\uDFFF with no high surrogate before. JSON.parse accepts them
+ * (the "\ud800" escape is legal JSON) and JSON.stringify re-emits them, but
+ * PostgreSQL's jsonb rejects them the same way it rejects \u0000.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * Make every string in a JSON tree (keys and values) jsonb-storable.
  *
- * PostgreSQL's jsonb rejects the \\u0000 escape outright (22P05), and one
- * such value in one record would abort the whole multi-row batch INSERT — a
- * single hostile agent payload poisoning up to 499 innocent records,
- * retried by the queue consumer until the batch dead-letters. NUL carries
- * no analytic meaning; removal (not rejection) keeps the record while
- * making it storable. Depth-bounded and cycle-safe by construction
- * (JSON.parse output only).
+ * PostgreSQL's jsonb rejects two classes of legal-in-JavaScript string
+ * content, and ONE such value in ONE record would abort the whole multi-row
+ * batch INSERT — a single hostile agent payload poisoning up to 499
+ * innocent records, retried by the queue consumer until the batch
+ * dead-letters (and, for the dead-letter drain itself, dropped for good):
+ *   - U+0000: rejected outright (22P05). NUL carries no analytic meaning;
+ *     it is removed.
+ *   - Unpaired surrogates (\uD800-\uDFFF alone): rejected as invalid JSON
+ *     text (22P02). Each is replaced with U+FFFD so the record keeps a
+ *     visible marker where the unpairable code unit sat.
+ * Removal/replacement (not rejection) keeps the record while making it
+ * storable. Depth-bounded and cycle-safe by construction (JSON.parse
+ * output only).
  */
 export function stripNulCharacters(value, depth = 0) {
   if (typeof value === 'string') {
-    return value.includes('\u0000') ? value.split('\u0000').join('') : value;
+    const noNul = value.includes('\u0000') ? value.split('\u0000').join('') : value;
+    // String.replace with a /g regex always scans from index 0 — safe to
+    // share the regex instance across calls.
+    return noNul.replace(LONE_SURROGATE, '\uFFFD');
   }
   if (value === null || typeof value !== 'object') return value;
   // FAIL CLOSED at the depth cap: returning the raw subtree would pass

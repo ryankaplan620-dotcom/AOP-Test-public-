@@ -26,6 +26,22 @@ test('csvField neutralizes spreadsheet formula injection', () => {
   assert.equal(csvField(0), '0');
 });
 
+test('csvField never guards numeric STRINGS — pg returns NUMERIC/BIGINT as strings', () => {
+  // A refund amount arrives from node-postgres as the string "-129.00";
+  // an apostrophe prefix would corrupt every negative money value in
+  // billing.csv (spreadsheets parse these as numbers, never formulas).
+  assert.equal(csvField('-129.00'), '-129.00');
+  assert.equal(csvField('-3'), '-3');
+  assert.equal(csvField('-1.5e3'), '-1.5e3');
+  // Non-numeric leading-trigger strings stay guarded.
+  assert.equal(csvField('-2+3'), "'-2+3");
+  assert.equal(csvField('-@cmd'), "'-@cmd");
+  assert.equal(csvField('-'), "'-");
+  assert.equal(csvField('-129.00 USD'), "'-129.00 USD");
+  // '+' never opens a pg numeric string; keep it guarded.
+  assert.equal(csvField('+123'), "'+123");
+});
+
 test('csvField renders null/undefined empty, dates as ISO, booleans as words', () => {
   assert.equal(csvField(null), '');
   assert.equal(csvField(undefined), '');

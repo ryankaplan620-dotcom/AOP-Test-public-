@@ -78,6 +78,7 @@ export function startRetentionSweep({ db, config, logger }) {
           limit: PURGE_BATCH_SIZE,
         });
         summary.dead_letters_deleted += deleted;
+        summary.batches += 1;
         if (deleted < PURGE_BATCH_SIZE) break;
       }
       if (summary.intents_deleted > 0 || summary.dead_letters_deleted > 0) {

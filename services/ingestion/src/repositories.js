@@ -1282,30 +1282,87 @@ export async function getLiftReport(db, { windowDays, halfDays, merchantId = nul
 // ---------------------------------------------------------------------------
 
 /**
+ * Postgres "data exception" class (SQLSTATE 22xxx): the VALUE was
+ * unstorable (invalid jsonb text, untranslatable character, ...). Anything
+ * else — connection loss, lock timeout, permission — is an infrastructure
+ * failure where retrying the batch is correct and absorbing the error
+ * would silently lose records.
+ */
+function isDataException(err) {
+  return typeof err?.code === 'string' && err.code.startsWith('22');
+}
+
+/**
  * Batch-insert dead-lettered records (routes/telemetry.js /ingest/dead-
  * letters, fed by the edge DLQ consumer). Records arrive pre-sanitized
- * (U+0000 stripped by the route); each is stored verbatim as jsonb.
+ * (U+0000 / lone surrogates scrubbed by the route); each is stored
+ * verbatim as jsonb.
+ *
+ * Totality contract: this endpoint is the LAST stop before permanent data
+ * loss (the DLQ consumer has no DLQ of its own), so a record PG refuses to
+ * store must degrade to a sentinel row — never abort the batch. The fast
+ * path is one multi-row INSERT; if PG rejects it with a data exception
+ * (22xxx), the fallback stores records one at a time, replacing any
+ * individually unstorable record with an {aop_unpreservable} sentinel
+ * under the same dedupe key. Infrastructure errors still throw, so the
+ * route 500s and the queue redelivers — and redelivery after partial
+ * progress is safe because every row carries the caller's dedupe key
+ * (ON CONFLICT DO NOTHING).
  *
  * @param {object} db
  * @param {Array<object>} records
  * @param {string} reason bounded to the column width by the route
+ * @param {Array<string|null>} [dedupeKeys] aligned with records; null =
+ *   no dedupe for that row
  * @returns {Promise<{stored: number}>}
  */
-export async function insertDeadLetters(db, records, reason) {
+export async function insertDeadLetters(db, records, reason, dedupeKeys = []) {
   if (!Array.isArray(records) || records.length === 0) return { stored: 0 };
+  const rowSql = `INSERT INTO dead_letter_telemetry (reason, record, dedupe_key)
+       VALUES ($1, $2, $3) ON CONFLICT (dedupe_key) DO NOTHING RETURNING id`;
+
   const values = [];
   const params = [];
   let p = 1;
-  for (const record of records) {
-    values.push(`($${p}, $${p + 1})`);
-    params.push(reason, JSON.stringify(record));
-    p += 2;
+  for (let i = 0; i < records.length; i += 1) {
+    values.push(`($${p}, $${p + 1}, $${p + 2})`);
+    params.push(reason, JSON.stringify(records[i]), dedupeKeys[i] ?? null);
+    p += 3;
   }
-  const result = await db.query(
-    `INSERT INTO dead_letter_telemetry (reason, record) VALUES ${values.join(', ')} RETURNING id`,
-    params
-  );
-  return { stored: result.rows.length };
+  try {
+    const result = await db.query(
+      `INSERT INTO dead_letter_telemetry (reason, record, dedupe_key)
+        VALUES ${values.join(', ')}
+        ON CONFLICT (dedupe_key) DO NOTHING RETURNING id`,
+      params
+    );
+    return { stored: result.rows.length };
+  } catch (err) {
+    if (!isDataException(err)) throw err;
+  }
+
+  // Fallback: the batch held at least one unstorable value. Store what PG
+  // will take, sentinel the rest — losing 1 record's content beats losing
+  // the batch.
+  let stored = 0;
+  for (let i = 0; i < records.length; i += 1) {
+    const key = dedupeKeys[i] ?? null;
+    try {
+      const one = await db.query(rowSql, [reason, JSON.stringify(records[i]), key]);
+      stored += one.rows.length;
+    } catch (err) {
+      if (!isDataException(err)) throw err;
+      // The sentinel is a fixed clean object; a failure storing IT is
+      // infrastructure by definition and propagates.
+      const one = await db.query(rowSql, [
+        reason,
+        JSON.stringify({ aop_unpreservable: true, cause: 'unstorable_jsonb' }),
+        key,
+      ]);
+      stored += one.rows.length;
+    }
+  }
+  return { stored };
 }
 
 /**

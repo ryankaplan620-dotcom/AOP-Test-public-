@@ -51,6 +51,12 @@ export function startDigestJob({ db, config, logger }) {
   let running = false;
   let stopped = false;
   let inFlight = Promise.resolve();
+  // Abort handle for the in-flight webhook POST: stop() must not wait out a
+  // hung endpoint (the 10s webhook timeout equals the process's entire
+  // graceful-shutdown budget). An aborted send never advanced the
+  // watermark, so it is simply retried after restart — the same asymmetric
+  // choice as a failed watermark write: a rare duplicate beats a lost week.
+  let webhookAbort = null;
 
   const withLock =
     typeof db.withAdvisoryLock === 'function'
@@ -85,15 +91,17 @@ export function startDigestJob({ db, config, logger }) {
       return { sent: false, reason: 'build_failed' };
     }
 
+    // One controller serves both the timeout and shutdown abort.
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timeoutTimer = controller ? setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS) : null;
+    timeoutTimer?.unref?.();
+    webhookAbort = controller;
     try {
       const response = await fetch(config.digestWebhookUrl, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(digest),
-        signal:
-          typeof AbortSignal !== 'undefined' && AbortSignal.timeout
-            ? AbortSignal.timeout(WEBHOOK_TIMEOUT_MS)
-            : undefined,
+        signal: controller?.signal,
       });
       if (!response.ok) {
         logger.error('digest webhook rejected delivery; will retry next check', {
@@ -104,6 +112,9 @@ export function startDigestJob({ db, config, logger }) {
     } catch (err) {
       logger.error('digest webhook unreachable; will retry next check', { err });
       return { sent: false, reason: 'webhook_unreachable' };
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      webhookAbort = null;
     }
 
     // Delivery confirmed -> advance the watermark. If THIS write fails the
@@ -153,6 +164,8 @@ export function startDigestJob({ db, config, logger }) {
     async stop() {
       stopped = true;
       clearInterval(timer);
+      // Cut a hung webhook POST loose instead of pinning shutdown on it.
+      webhookAbort?.abort();
       await inFlight;
       logger.info('digest job stopped');
     },
