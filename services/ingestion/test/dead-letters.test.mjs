@@ -291,10 +291,15 @@ test('digest job sends when due, POSTs the platform digest, and advances the wat
   });
   const result = await job.runOnce(); // startup tick is parked; this pass sends
   releaseStartupTick();
-  await job.stop(); // startup tick resumes, sees the watermark -> not_due
+  // The resumed startup tick cannot send regardless of the watermark:
+  // stop() already set `stopped`, so it takes the pre-fetch bail even if
+  // the due-check were broken. The due-gate property itself is pinned by
+  // the 'does NOT send when not due' test below — this assertion only
+  // guards against a double-send WITHIN the explicit pass.
+  await job.stop();
 
   assert.equal(result.sent, true);
-  assert.equal(posts.length, 1, 'exactly one send: the resumed startup tick was gated by the watermark');
+  assert.equal(posts.length, 1, 'exactly one send from the explicit pass');
   assert.equal(posts[0].url, 'https://hooks.example/digest');
   assert.equal(posts[0].body.kind, 'aop_weekly_digest');
   assert.equal(posts[0].body.scope, 'platform');
