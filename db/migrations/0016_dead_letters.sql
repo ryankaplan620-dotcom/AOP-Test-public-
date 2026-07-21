@@ -28,23 +28,8 @@ CREATE TABLE IF NOT EXISTS dead_letter_telemetry (
     reason VARCHAR(120) NOT NULL DEFAULT 'unknown',
 
     -- The raw telemetry record as it sat on the queue.
-    record JSONB NOT NULL,
-
-    -- Caller-supplied idempotency key (the edge sends "<queue>:<message id>").
-    -- Queues delivery is at-least-once: a preservation POST whose REPLY was
-    -- lost gets the whole batch redelivered, and without this key every
-    -- record would be stored twice. NULL = no dedupe (a unique index treats
-    -- NULLs as distinct).
-    dedupe_key TEXT
+    record JSONB NOT NULL
 );
-
--- Guarded ALTER so the column also lands on databases that applied the
--- table-only shape of this migration.
-ALTER TABLE dead_letter_telemetry ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
 
 CREATE INDEX IF NOT EXISTS dead_letter_telemetry_received_idx
     ON dead_letter_telemetry (received_at DESC);
-
--- Arbiter for ON CONFLICT (dedupe_key) DO NOTHING in insertDeadLetters.
-CREATE UNIQUE INDEX IF NOT EXISTS dead_letter_telemetry_dedupe_idx
-    ON dead_letter_telemetry (dedupe_key);

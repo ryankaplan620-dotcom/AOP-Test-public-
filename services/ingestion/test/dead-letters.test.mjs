@@ -250,25 +250,58 @@ test('digest job sends when due, POSTs the platform digest, and advances the wat
     globalThis.fetch = realFetch;
   });
 
-  const db = digestDb({ watermark: null }); // never sent -> due
+  // Stateful fake: the STARTUP tick parks on its watermark read until the
+  // explicit runOnce() below has finished, then sees the watermark that
+  // send wrote and must conclude not_due. (stop() can no longer be used to
+  // drain a send — a pass that observes `stopped` before its POST starts
+  // now deliberately bails.)
+  let watermark = null;
+  let parkFirstRead = true;
+  let releaseStartupTick;
+  const startupGate = new Promise((resolve) => {
+    releaseStartupTick = resolve;
+  });
+  const statements = [];
+  const db = {
+    async query(text, params = []) {
+      statements.push({ text, params });
+      if (/INSERT INTO sweep_state/.test(text)) {
+        watermark = params[1];
+        return { rows: [], rowCount: 1 };
+      }
+      if (/FROM sweep_state/.test(text)) {
+        if (parkFirstRead) {
+          parkFirstRead = false;
+          await startupGate;
+        }
+        return watermark === null
+          ? { rows: [], rowCount: 0 }
+          : { rows: [{ watermark }], rowCount: 1 };
+      }
+      for (const [pattern, resp] of digestBuildScript) {
+        if (pattern.test(text)) return { rows: [], rowCount: 0, ...resp };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
   const job = startDigestJob({
     db,
     config: { digestWebhookUrl: 'https://hooks.example/digest', digestIntervalMs: 7 * 24 * 3600 * 1000 },
     logger: silentLogger,
   });
-  // The job fires a catch-up tick at startup; stop() awaits it. (An explicit
-  // runOnce() on top would double-send here ONLY because the fake db never
-  // persists the watermark the first send wrote.)
-  await job.stop();
+  const result = await job.runOnce(); // startup tick is parked; this pass sends
+  releaseStartupTick();
+  await job.stop(); // startup tick resumes, sees the watermark -> not_due
 
-  assert.equal(posts.length, 1);
+  assert.equal(result.sent, true);
+  assert.equal(posts.length, 1, 'exactly one send: the resumed startup tick was gated by the watermark');
   assert.equal(posts[0].url, 'https://hooks.example/digest');
   assert.equal(posts[0].body.kind, 'aop_weekly_digest');
   assert.equal(posts[0].body.scope, 'platform');
   assert.equal(posts[0].body.dead_letters, 5); // ops alert included
   assert.ok(posts[0].body.text.includes('ALERT: 5 telemetry record(s) dead-lettered'));
   // Watermark advanced (durable no-double-send).
-  const wm = db.statements.find((s) => /INSERT INTO sweep_state/.test(s.text));
+  const wm = statements.find((s) => /INSERT INTO sweep_state/.test(s.text));
   assert.ok(wm, 'watermark written');
   assert.equal(wm.params[0], DIGEST_JOB_NAME);
 });
@@ -309,6 +342,50 @@ test('digest job does NOT send when not due, and does NOT advance on webhook fai
   await jobFail.stop();
   assert.equal(failed.sent, false);
   assert.ok(!dbFail.statements.some((s) => /INSERT INTO sweep_state/.test(s.text)), 'watermark NOT advanced');
+});
+
+test('digest stop() during the DB phase prevents a post-shutdown webhook POST', async (t) => {
+  // stop() can only abort a POST that already started; a pass still in its
+  // DB phase must re-check `stopped` before STARTING one — otherwise a
+  // hung webhook pins shutdown for the full 10s timeout (= the process's
+  // entire watchdog budget).
+  let fetched = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetched += 1;
+    return new Response('ok', { status: 200 });
+  };
+  t.after(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  let releaseWatermark;
+  const gate = new Promise((resolve) => {
+    releaseWatermark = resolve;
+  });
+  const db = {
+    async query(text) {
+      if (/FROM sweep_state/.test(text)) {
+        await gate; // hold the pass in its DB phase until stop() has run
+        return { rows: [], rowCount: 0 }; // no watermark -> digest is due
+      }
+      for (const [pattern, resp] of digestBuildScript) {
+        if (pattern.test(text)) return { rows: [], rowCount: 0, ...resp };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
+
+  const job = startDigestJob({
+    db,
+    config: { digestWebhookUrl: 'https://hooks.example/digest', digestIntervalMs: 1 },
+    logger: silentLogger,
+  });
+  // The startup tick is now blocked inside the watermark read.
+  const stopping = job.stop();
+  releaseWatermark(); // pass resumes: due -> build -> must bail before fetch
+  await stopping;
+  assert.equal(fetched, 0, 'no webhook POST may start after stop()');
 });
 
 test('digest job is a no-op when DIGEST_WEBHOOK_URL is unset', async () => {

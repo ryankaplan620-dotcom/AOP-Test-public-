@@ -297,6 +297,25 @@ test('stripNulCharacters scrubs jsonb-fatal content: NUL removed, lone surrogate
   assert.deepEqual(stripNulCharacters({ ['k\ud800']: ['v\u0000'] }), { ['k\ufffd']: ['v'] });
 });
 
+test('the 2048-unit query slice cannot bisect an astral pair back into a lone surrogate', () => {
+  // The record-wide scrub runs FIRST; buildEdgeMeta's bound on query runs
+  // after — cutting at a code-unit boundary would otherwise re-introduce
+  // exactly the lone surrogate that 22P02s the jsonb batch INSERT.
+  const emoji = '😀'; // U+1F600: one astral pair, two code units
+  const verdict = validateTelemetryRecord(
+    wireRecord({ query: 'a'.repeat(2047) + emoji + 'tail' })
+  );
+  assert.equal(verdict.ok, true);
+  const sliced = verdict.value.payload._edge.query;
+  assert.equal(sliced.length, 2048);
+  assert.equal(sliced.charCodeAt(2047), 0xfffd, 'bisected pair must become U+FFFD, not a lone surrogate');
+  // Whole-record round trip must be jsonb-representable JSON.
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(sliced));
+  // A pair that lands INSIDE the bound survives intact.
+  const inside = validateTelemetryRecord(wireRecord({ query: emoji + 'rest' }));
+  assert.equal(inside.value.payload._edge.query.slice(0, 2), emoji);
+});
+
 test('validateTelemetryRecord scrubs lone surrogates from the stored payload (ingest hot path)', () => {
   const verdict = validateTelemetryRecord(
     wireRecord({ inbound_payload: { note: 'x\ud800y' } })

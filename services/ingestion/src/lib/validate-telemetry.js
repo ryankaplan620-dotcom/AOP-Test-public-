@@ -139,7 +139,10 @@ function buildEdgeMeta(record) {
 
   const query = asTrimmedString(record.query);
   // Bounded: query strings can carry junk; 2KB is plenty for diagnostics.
-  if (query !== null) meta.query = query.slice(0, 2048);
+  // The slice runs AFTER the record-wide surrogate scrub, and cutting at a
+  // code-UNIT boundary can bisect an astral pair — re-introducing exactly
+  // the lone surrogate that 22P02s the jsonb batch INSERT. Scrub the cut.
+  if (query !== null) meta.query = query.slice(0, 2048).replace(/[\uD800-\uDBFF]$/, '\uFFFD');
 
   const observedAt = asTrimmedString(record.observed_at);
   // Sanity-shape check only (full ISO validation is overkill for a debug field).

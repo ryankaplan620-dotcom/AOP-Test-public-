@@ -96,6 +96,17 @@ export function startDigestJob({ db, config, logger }) {
     const timeoutTimer = controller ? setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS) : null;
     timeoutTimer?.unref?.();
     webhookAbort = controller;
+    // stop() may have landed while this pass was still in its DB phase —
+    // webhookAbort was null then, so its abort() was a no-op, and starting
+    // a webhook POST now would outlive shutdown (the 10s webhook timeout
+    // IS the whole watchdog budget). Assign the controller FIRST, then
+    // re-check: whichever way stop() interleaves, either this check sees
+    // `stopped` or stop() sees the controller.
+    if (stopped) {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      webhookAbort = null;
+      return { sent: false, reason: 'stopping' };
+    }
     try {
       const response = await fetch(config.digestWebhookUrl, {
         method: 'POST',

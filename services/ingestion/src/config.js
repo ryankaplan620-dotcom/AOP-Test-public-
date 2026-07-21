@@ -233,7 +233,13 @@ export function loadConfig(env = process.env) {
         digestWebhookUrl = candidate;
       }
     } catch {
-      problems.push(`DIGEST_WEBHOOK_URL="${digestRaw}" is invalid — expected an http(s) URL`);
+      // Not echoed either: a MALFORMED value can still embed credentials
+      // (e.g. "http://user:pass@" with a typo'd host) and this message
+      // lands in deploy logs. Withholding the value costs a little
+      // debuggability; leaking a webhook password costs more.
+      problems.push(
+        'DIGEST_WEBHOOK_URL is invalid — expected an http(s) URL (value withheld from logs in case it embeds credentials)'
+      );
     }
   }
   // Send cadence. Default weekly; floor 1h (sub-hourly "weekly digests" are

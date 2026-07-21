@@ -165,8 +165,15 @@ export function buildTelemetryRouter({ config, db, logger }) {
 
       const { stored } = await insertDeadLetters(db, sanitized, reason, dedupeKeys);
       // warn (not info): dead letters mean the ingest pipeline dropped
-      // batches past all retries — an operator should notice.
-      logger.warn('dead-lettered telemetry preserved', { stored, reason });
+      // batches past all retries — an operator should notice. `deduped`
+      // makes a silent dedupe-key drop observable: >0 is normal on queue
+      // redelivery, but persistent non-zero without redelivery would mean
+      // colliding keys discarding content.
+      logger.warn('dead-lettered telemetry preserved', {
+        stored,
+        deduped: sanitized.length - stored,
+        reason,
+      });
       res.json({ stored });
     } catch (err) {
       next(err);
