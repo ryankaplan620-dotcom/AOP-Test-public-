@@ -1500,3 +1500,95 @@ export async function revokeMerchantApiKey(db, keyId) {
   const exists = await db.query(`SELECT 1 FROM merchant_api_keys WHERE id = $1`, [keyId]);
   return exists.rows.length > 0 ? 'already_revoked' : 'not_found';
 }
+
+// Rollout hardening (migration 0018): integration health and recommendation
+// lifecycle are tenant-scoped, auditable records rather than UI-only state.
+export async function upsertIntegrationHealth(db, { merchantId, webhookStatus }) {
+  const healthy = Object.values(webhookStatus).every((status) => status === 'registered' || status === 'already_registered');
+  const result = await db.query(
+    `INSERT INTO merchant_integrations (merchant_id, provider, status, webhook_status)
+     VALUES ($1, 'shopify', $2, $3::jsonb)
+     ON CONFLICT (merchant_id) DO UPDATE SET status = EXCLUDED.status,
+       webhook_status = EXCLUDED.webhook_status, checked_at = now(), updated_at = now()
+     RETURNING status, webhook_status, checked_at`,
+    [merchantId, healthy ? 'healthy' : 'degraded', JSON.stringify(webhookStatus)]
+  );
+  return result.rows[0];
+}
+
+export async function createRecommendation(db, { merchantId, kind, payload }) {
+  const result = await db.query(
+    `INSERT INTO merchant_recommendations (merchant_id, kind, payload) VALUES ($1, $2, $3::jsonb)
+     RETURNING id, kind, payload, status, created_at`,
+    [merchantId, kind, JSON.stringify(payload)]
+  );
+  return result.rows[0];
+}
+
+export async function transitionRecommendation(db, { merchantId, id, from, to }) {
+  const stamps = { approved: 'approved_at', running: 'published_at', rolled_back: 'rolled_back_at' };
+  const stamp = stamps[to] ? `, ${stamps[to]} = now()` : '';
+  const result = await db.query(
+    `UPDATE merchant_recommendations SET status = $4${stamp}
+     WHERE id = $1 AND merchant_id = $2 AND status = $3
+     RETURNING id, kind, payload, status, approved_at, published_at, rolled_back_at`,
+    [id, merchantId, from, to]
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function createExperiment(db, { merchantId, recommendationId, controlShare }) {
+  const result = await db.query(
+    `INSERT INTO recommendation_experiments (recommendation_id, control_share)
+     SELECT id, $3 FROM merchant_recommendations
+      WHERE id = $1 AND merchant_id = $2 AND status = 'approved'
+     RETURNING id, recommendation_id, control_share, started_at`,
+    [recommendationId, merchantId, controlShare]
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function getIntegrationHealth(db, merchantId) {
+  const result = await db.query(
+    `SELECT provider, status, webhook_status, checked_at FROM merchant_integrations WHERE merchant_id = $1`, [merchantId]
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function createDashboardSession(db, { tokenHash, merchantId, expiresAt }) {
+  await db.query(
+    `INSERT INTO merchant_dashboard_sessions (token_hash, merchant_id, expires_at) VALUES ($1, $2, $3)`,
+    [tokenHash, merchantId, expiresAt]
+  );
+}
+
+export async function findDashboardSession(db, tokenHash) {
+  const result = await db.query(
+    `SELECT s.merchant_id, p.shopify_shop_domain
+       FROM merchant_dashboard_sessions s JOIN merchant_profiles p ON p.id = s.merchant_id
+      WHERE s.token_hash = $1 AND s.expires_at > now()`, [tokenHash]
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function deleteDashboardSession(db, tokenHash) {
+  await db.query(`DELETE FROM merchant_dashboard_sessions WHERE token_hash = $1`, [tokenHash]);
+}
+
+// Privacy-preserving network benchmark: never returns a merchant identifier
+// and suppresses any bucket represented by fewer than three merchants.
+export async function getNetworkBenchmark(db, { windowDays }) {
+  const result = await db.query(
+    `SELECT protocol_type AS protocol, count(*)::int AS impressions,
+            count(DISTINCT merchant_id)::int AS merchant_count,
+            count(DISTINCT CASE WHEN o.id IS NOT NULL THEN i.id END)::int AS orders_won
+       FROM agent_intent_logs i
+       LEFT JOIN reconciled_agent_orders o ON o.intent_log_id = i.id
+      WHERE i.processed_at >= now() - ($1::int * interval '1 day')
+      GROUP BY protocol_type
+     HAVING count(DISTINCT merchant_id) >= 3
+      ORDER BY impressions DESC`,
+    [windowDays]
+  );
+  return result.rows;
+}

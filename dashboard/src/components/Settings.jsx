@@ -10,7 +10,7 @@
  * migration 0014):
  *   - the platform DASHBOARD_API_TOKEN — sees every merchant, or
  *   - a merchant API key ('aop_live_…') — scoped to that one shop.
- * "Verify access" calls /analytics/whoami so the operator can see which
+ * "Sign in" calls /analytics/whoami so the operator can see which
  * scope the pasted credential actually grants before trusting the numbers.
  *
  * The credential is exactly that: the input uses type="password" so it never
@@ -20,11 +20,12 @@
  */
 
 import React, { useState } from 'react';
-import { saveSettings, fetchWhoami } from '../api.js';
+import { saveSettings, establishSession } from '../api.js';
 
 export default function Settings({ settings, onChange }) {
   const [draft, setDraft] = useState(settings);
   const [saved, setSaved] = useState(false);
+  const [merchantKey, setMerchantKey] = useState('');
   const [scope, setScope] = useState(null); // {ok, text} after a verify
 
   const update = (key) => (event) => {
@@ -35,7 +36,6 @@ export default function Settings({ settings, onChange }) {
 
   const cleanedDraft = () => ({
     analyticsUrl: draft.analyticsUrl.trim(),
-    dashboardToken: draft.dashboardToken.trim(),
     optimizerUrl: draft.optimizerUrl.trim(),
   });
 
@@ -47,18 +47,13 @@ export default function Settings({ settings, onChange }) {
   };
 
   const verify = async () => {
-    setScope({ ok: null, text: 'Checking…' });
+    setScope({ ok: null, text: 'Starting secure session…' });
     try {
-      const who = await fetchWhoami(cleanedDraft());
-      setScope({
-        ok: true,
-        text:
-          who.role === 'platform'
-            ? 'Platform credential — all merchants visible'
-            : `Merchant credential — scoped to ${who.shop_domain ?? who.merchant_id}`,
-      });
+      const session = await establishSession(draft.analyticsUrl.trim(), merchantKey.trim());
+      setMerchantKey('');
+      setScope({ ok: true, text: `Signed in for ${session.shop_domain}; access expires ${new Date(session.expires_at).toLocaleTimeString()}.` });
     } catch (err) {
-      setScope({ ok: false, text: err?.message ?? 'Verification failed' });
+      setScope({ ok: false, text: err?.message ?? 'Sign-in failed' });
     }
   };
 
@@ -66,7 +61,7 @@ export default function Settings({ settings, onChange }) {
     <div className="panel">
       <h2>Connection Settings</h2>
       <p className="sub">
-        Saved in this browser only. Defaults match the local-development walkthrough
+        URLs are saved in this browser; access is an HttpOnly session cookie and the API key is not stored. Defaults match the local-development walkthrough
         (docs/local-development.md).
       </p>
       <div className="settings-grid">
@@ -75,13 +70,8 @@ export default function Settings({ settings, onChange }) {
           <input value={draft.analyticsUrl} onChange={update('analyticsUrl')} placeholder="http://localhost:8787" />
         </label>
         <label>
-          Access credential (platform token or merchant API key)
-          <input
-            type="password"
-            value={draft.dashboardToken}
-            onChange={update('dashboardToken')}
-            placeholder="DASHBOARD_API_TOKEN or aop_live_…"
-          />
+          Merchant API key (used once to start a secure session)
+          <input type="password" value={merchantKey} onChange={(event) => setMerchantKey(event.target.value)} placeholder="aop_live_…" autoComplete="off" />
         </label>
         <label>
           Optimizer microservice URL
@@ -92,7 +82,7 @@ export default function Settings({ settings, onChange }) {
         Save settings
       </button>
       <button className="btn" type="button" onClick={verify}>
-        Verify access
+        Sign in
       </button>
       {saved ? <span className="saved-note">Saved ✓</span> : null}
       {scope ? (

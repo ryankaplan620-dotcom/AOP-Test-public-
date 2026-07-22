@@ -18,7 +18,6 @@ const STORAGE_KEY = 'aop-dashboard-settings';
 
 export const DEFAULT_SETTINGS = {
   analyticsUrl: 'http://localhost:8787',
-  dashboardToken: '',
   optimizerUrl: 'http://localhost:8899',
 };
 
@@ -28,7 +27,9 @@ export function loadSettings() {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw);
-    return { ...DEFAULT_SETTINGS, ...(parsed && typeof parsed === 'object' ? parsed : {}) };
+    const next = { ...DEFAULT_SETTINGS, ...(parsed && typeof parsed === 'object' ? parsed : {}) };
+    delete next.dashboardToken;
+    return next;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -37,7 +38,8 @@ export function loadSettings() {
 /** Persist settings; never throws (private-mode storage failures are moot). */
 export function saveSettings(settings) {
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    const { dashboardToken: _discarded, ...safeSettings } = settings;
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(safeSettings));
   } catch {
     /* storage unavailable — session-only settings still work in memory */
   }
@@ -64,6 +66,7 @@ async function request(url, { method = 'GET', token = null, body = null } = {}) 
       headers,
       body: body === null ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(10_000),
+      credentials: 'include',
     });
   } catch (err) {
     throw new Error(
@@ -71,6 +74,7 @@ async function request(url, { method = 'GET', token = null, body = null } = {}) 
     );
   }
 
+  if (response.status === 204) return {};
   let payload = null;
   try {
     payload = await response.json();
@@ -91,6 +95,14 @@ async function request(url, { method = 'GET', token = null, body = null } = {}) 
 }
 
 // ---- Loss Diagnosis (ingestion /analytics) --------------------------------
+
+export async function establishSession(analyticsUrl, merchantApiKey) {
+  return request(`${baseOf(analyticsUrl)}/analytics/session`, { method: 'POST', token: merchantApiKey });
+}
+
+export function endSession(analyticsUrl) {
+  return request(`${baseOf(analyticsUrl)}/analytics/session`, { method: 'DELETE' });
+}
 
 export function fetchSummary(settings, days) {
   return request(`${baseOf(settings.analyticsUrl)}/analytics/summary?days=${days}`, {

@@ -35,7 +35,7 @@ import {
   deriveProxyHostname,
 } from '../lib/shopify-oauth.js';
 import { encryptToken } from '../lib/token-crypto.js';
-import { upsertMerchantToken } from '../repositories.js';
+import { upsertMerchantToken, upsertIntegrationHealth } from '../repositories.js';
 
 /** Admin API version used for webhook registration. */
 const ADMIN_API_VERSION = '2025-01';
@@ -214,21 +214,30 @@ export function buildOAuthRouter({ config, db, logger, adminBaseOverride }) {
         logger,
         adminBaseOverride,
       });
+      const integration = await upsertIntegrationHealth(db, { merchantId: merchant.id, webhookStatus });
+      const healthy = integration.status === 'healthy';
 
-      logger.info('merchant installed', {
+      logger.info('merchant installation checked', {
         shop,
         merchant_id: merchant.id,
+        integration_status: integration.status,
         webhooks: webhookStatus,
       });
-      res.status(200).json({
-        ok: true,
+      // Do not present a merchant as installed when any money or attribution
+      // webhook is absent. The persisted degraded record makes retry/remediation
+      // visible instead of silently creating an untracked tenant.
+      res.status(healthy ? 200 : 502).json({
+        ok: healthy,
         shop,
         merchant_id: merchant.id,
+        integration_status: integration.status,
         webhooks: webhookStatus,
         proxy_hostname: merchant.proxy_hostname ?? null,
-        next_step: merchant.proxy_hostname
-          ? `Point your ACP/AP2 endpoint configuration at https://${merchant.proxy_hostname} — agent telemetry starts flowing immediately.`
-          : 'Ask your AOP operator to assign your proxy hostname (merchant_profiles.proxy_hostname), then point your ACP/AP2 endpoints at it.',
+        next_step: healthy
+          ? (merchant.proxy_hostname
+            ? `Point your ACP/AP2 endpoint configuration at https://${merchant.proxy_hostname} — agent telemetry starts flowing immediately.`
+            : 'Assign a proxy hostname, then point your ACP/AP2 endpoint configuration at it.')
+          : 'Webhook registration is incomplete. Retry the install after Shopify Admin API access is available; attribution and billing remain disabled.',
       });
     } catch (err) {
       next(err); // central handler: opaque 500, full log

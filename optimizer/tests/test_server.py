@@ -7,6 +7,7 @@ urllib — no external deps, no fixed ports, safe in CI.
 import json
 import threading
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 
@@ -27,12 +28,12 @@ class ServerTestCase(unittest.TestCase):
         cls.server.server_close()
 
     # ------------------------------------------------------------------ util
-    def _post(self, path, body, raw=False):
+    def _post(self, path, body, raw=False, headers=None):
         data = body if raw else json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}",
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **(headers or {})},
             method="POST",
         )
         try:
@@ -55,7 +56,15 @@ class ServerTestCase(unittest.TestCase):
         self.assertEqual(payload["schema_version"], "1.0.0")
         self.assertIn("agent_match_score", payload)
         self.assertNotIn("policy_jsonld", payload, "/score omits the rewrite artifact")
-        self.assertEqual(headers.get("Access-Control-Allow-Origin"), "*")
+        self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
+
+    def test_optimizer_token_protects_scoring_endpoints(self):
+        with patch.dict("os.environ", {"AOP_OPTIMIZER_TOKEN": "test-secret"}):
+            status, payload, _ = self._post("/score", {"policy_text": "14-day returns"})
+            self.assertEqual(status, 401)
+            self.assertEqual(payload, {"error": "unauthorized"})
+            status, _, _ = self._post("/score", {"policy_text": "14-day returns"}, headers={"Authorization": "Bearer test-secret"})
+            self.assertEqual(status, 200)
 
     def test_rewrite_includes_jsonld_artifact(self):
         status, payload, _ = self._post(
@@ -100,7 +109,7 @@ class ServerTestCase(unittest.TestCase):
         )
         with urllib.request.urlopen(request) as response:
             self.assertEqual(response.status, 204)
-            self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "*")
+            self.assertIsNone(response.headers.get("Access-Control-Allow-Origin"))
             self.assertIn("POST", response.headers.get("Access-Control-Allow-Methods", ""))
 
 
