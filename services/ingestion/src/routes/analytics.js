@@ -51,6 +51,7 @@
  */
 
 import express from 'express';
+import { createHash, randomBytes } from 'node:crypto';
 import { timingSafeTokenCheck } from '../lib/auth.js';
 import { isApiKeyShaped, hashApiKey, generateApiKey } from '../lib/api-keys.js';
 import { parseWindowDays, parseLimit, percentShare, parseBillingMonth } from '../lib/analytics-params.js';
@@ -73,6 +74,14 @@ import {
   revokeMerchantApiKey,
   getEnrichment,
   upsertEnrichment,
+  getIntegrationHealth,
+  createRecommendation,
+  transitionRecommendation,
+  createExperiment,
+  createDashboardSession,
+  findDashboardSession,
+  deleteDashboardSession,
+  getNetworkBenchmark,
 } from '../repositories.js';
 
 /** Postgres UUID literal gate: bad ids become clean 4xx, never a 22P02 500. */
@@ -92,6 +101,7 @@ export function buildAnalyticsRouter({ config, db, logger }) {
     res.set('Access-Control-Allow-Origin', config.dashboardAllowedOrigin);
     res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.set('Access-Control-Allow-Credentials', 'true');
     if (req.method === 'OPTIONS') {
       res.status(204).end();
       return;
@@ -107,6 +117,17 @@ export function buildAnalyticsRouter({ config, db, logger }) {
     if (config.dashboardApiToken === null) {
       res.status(503).json({ error: 'analytics disabled (DASHBOARD_API_TOKEN not configured)' });
       return;
+    }
+    const sessionToken = readCookie(req.get('cookie'), SESSION_COOKIE);
+    if (sessionToken && /^[A-Za-z0-9_-]{40,}$/.test(sessionToken)) {
+      try {
+        const session = await findDashboardSession(db, hashSession(sessionToken));
+        if (session) {
+          req.aopAuth = { role: 'merchant', merchantId: session.merchant_id, shopDomain: session.shopify_shop_domain };
+          next();
+          return;
+        }
+      } catch (err) { next(err); return; }
     }
     const match = /^Bearer\s+(.+)$/i.exec(req.get('authorization') ?? '');
     const presented = match ? match[1].trim() : null;
@@ -151,6 +172,85 @@ export function buildAnalyticsRouter({ config, db, logger }) {
     }
     return true;
   }
+
+  // ---- Browser session exchange -------------------------------------------
+  // Merchant keys are exchanged once and never written to browser storage.
+  // Subsequent analytics reads use a short-lived, HttpOnly, SameSite cookie.
+  router.post('/session', async (req, res, next) => {
+    try {
+      if (req.aopAuth.role !== 'merchant') { res.status(403).json({ error: 'merchant API key required' }); return; }
+      const token = randomBytes(32).toString('base64url');
+      const expires = new Date(Date.now() + SESSION_TTL_MS);
+      await createDashboardSession(db, { tokenHash: hashSession(token), merchantId: req.aopAuth.merchantId, expiresAt: expires });
+      res.cookie(SESSION_COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', expires, path: '/analytics' });
+      res.status(201).json({ expires_at: expires.toISOString(), shop_domain: req.aopAuth.shopDomain });
+    } catch (err) { next(err); }
+  });
+
+  router.delete('/session', async (req, res, next) => {
+    try {
+      const token = readCookie(req.get('cookie'), SESSION_COOKIE);
+      if (token) await deleteDashboardSession(db, hashSession(token));
+      res.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', path: '/analytics' });
+      res.status(204).end();
+    } catch (err) { next(err); }
+  });
+
+  // ---- Shopify integration health -----------------------------------------
+  router.get('/integration-health', async (req, res, next) => {
+    try {
+      if (req.aopAuth.merchantId === null) {
+        res.status(400).json({ error: 'merchant-scoped credential required' });
+        return;
+      }
+      res.json({ integration: await getIntegrationHealth(db, req.aopAuth.merchantId) });
+    } catch (err) { next(err); }
+  });
+
+  // ---- Recommendation lifecycle -------------------------------------------
+  // A recommendation becomes measurable only after explicit approval and a
+  // persisted treatment/control experiment. State transitions are conditional
+  // in SQL to make stale dashboard clicks harmless.
+  router.post('/recommendations', async (req, res, next) => {
+    try {
+      if (req.aopAuth.merchantId === null) { res.status(403).json({ error: 'merchant-scoped credential required' }); return; }
+      const { kind, payload } = req.body ?? {};
+      if (!['policy', 'claims', 'jsonld'].includes(kind) || payload === null || typeof payload !== 'object') {
+        res.status(400).json({ error: 'kind and object payload are required' }); return;
+      }
+      res.status(201).json({ recommendation: await createRecommendation(db, { merchantId: req.aopAuth.merchantId, kind, payload }) });
+    } catch (err) { next(err); }
+  });
+
+  router.post('/recommendations/:id/approve', async (req, res, next) => {
+    try {
+      if (req.aopAuth.merchantId === null || !UUID_SHAPE.test(req.params.id)) { res.status(400).json({ error: 'valid merchant recommendation id required' }); return; }
+      const recommendation = await transitionRecommendation(db, { merchantId: req.aopAuth.merchantId, id: req.params.id, from: 'draft', to: 'approved' });
+      if (!recommendation) { res.status(409).json({ error: 'recommendation is not an approvable draft' }); return; }
+      res.json({ recommendation });
+    } catch (err) { next(err); }
+  });
+
+  router.post('/recommendations/:id/experiments', async (req, res, next) => {
+    try {
+      if (req.aopAuth.merchantId === null || !UUID_SHAPE.test(req.params.id)) { res.status(400).json({ error: 'valid merchant recommendation id required' }); return; }
+      const controlShare = Number(req.body?.control_share);
+      if (!Number.isFinite(controlShare) || controlShare <= 0 || controlShare >= 1) { res.status(400).json({ error: 'control_share must be between 0 and 1' }); return; }
+      const experiment = await createExperiment(db, { merchantId: req.aopAuth.merchantId, recommendationId: req.params.id, controlShare });
+      if (!experiment) { res.status(409).json({ error: 'recommendation is not an approved experiment candidate' }); return; }
+      const recommendation = await transitionRecommendation(db, { merchantId: req.aopAuth.merchantId, id: req.params.id, from: 'approved', to: 'running' });
+      res.status(201).json({ experiment, recommendation });
+    } catch (err) { next(err); }
+  });
+
+  router.post('/recommendations/:id/rollback', async (req, res, next) => {
+    try {
+      if (req.aopAuth.merchantId === null || !UUID_SHAPE.test(req.params.id)) { res.status(400).json({ error: 'valid merchant recommendation id required' }); return; }
+      const recommendation = await transitionRecommendation(db, { merchantId: req.aopAuth.merchantId, id: req.params.id, from: 'running', to: 'rolled_back' });
+      if (!recommendation) { res.status(409).json({ error: 'recommendation is not running' }); return; }
+      res.json({ recommendation });
+    } catch (err) { next(err); }
+  });
 
   // ---- GET /analytics/whoami ---------------------------------------------
   // Lets the dashboard label its scope ("All merchants" vs the shop) and
@@ -311,6 +411,19 @@ export function buildAnalyticsRouter({ config, db, logger }) {
     } catch (err) {
       next(err);
     }
+  });
+
+  // ---- Platform-only anonymized network benchmark --------------------------
+  router.get('/network-benchmark', async (req, res, next) => {
+    try {
+      if (!platformOnly(req, res)) return;
+      const windowDays = parseWindowDays(req.query.days);
+      const rows = await getNetworkBenchmark(db, { windowDays });
+      res.json({ window_days: windowDays, minimum_merchant_count: 3, buckets: rows.map((row) => ({
+        protocol: row.protocol, impressions: Number(row.impressions), merchant_count: Number(row.merchant_count),
+        conversion_rate_pct: percentShare(Number(row.orders_won), Number(row.impressions)),
+      })) });
+    } catch (err) { next(err); }
   });
 
   // ---- GET /analytics/benchmark --------------------------------------------

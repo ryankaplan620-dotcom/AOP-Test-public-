@@ -51,10 +51,8 @@ Design constraints:
     and the server keeps that guarantee.
   - This is an internal admin-panel backend, expected to sit behind the
     merchant app's auth/reverse proxy — it binds 127.0.0.1 by default.
-  - Permissive CORS (Access-Control-Allow-Origin: *) because the local
-    dashboard dev server runs on a different port; the payload is derived
-    entirely from the caller's own request body, so cross-origin readability
-    leaks nothing.
+  - CORS is disabled by default. Set AOP_OPTIMIZER_ALLOWED_ORIGIN to the
+    single dashboard origin when a reverse proxy exposes this service.
   - Bounded request bodies (256KB) and JSON error responses with correct
     status codes; a scoring failure can never take the process down.
 
@@ -169,9 +167,23 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_cors_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = os.environ.get("AOP_OPTIMIZER_ALLOWED_ORIGIN", "").strip()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-AOP-Calibrate")
+
+    def _optimizer_authorized(self) -> bool:
+        expected = os.environ.get("AOP_OPTIMIZER_TOKEN", "").strip()
+        if not expected:
+            return True
+        match = re.match(r"^Bearer\s+(.+)$", self.headers.get("Authorization", "") or "", re.IGNORECASE)
+        presented = match.group(1).strip() if match else ""
+        if hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
+            return True
+        self._send_json(401, {"error": "unauthorized"})
+        return False
 
     # ------------------------------------------------------- calibration
     def _get_calibration(self) -> Optional[Dict[str, Any]]:
@@ -272,6 +284,8 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/healthz" and not self._optimizer_authorized():
+            return
         if self.path == "/healthz":
             self._send_json(200, {"status": "ok"})
             return
@@ -301,6 +315,8 @@ class OptimizerRequestHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"source": "default", "reset": True})
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._optimizer_authorized():
+            return
         if self.path not in ("/score", "/rewrite", "/simulate", "/claims", "/calibrate"):
             self._send_json(404, {"error": "not found"})
             return
