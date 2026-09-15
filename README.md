@@ -1,32 +1,3 @@
-# AOP — Agent Optimization Platform
-
-**The "Ahrefs + Google Analytics for AI Commerce."**
-
-AI shopping agents (OpenAI/Stripe **ACP**, Google **AP2**) buy by querying merchant
-endpoints directly — no browser, no pixel, no cookie. Merchants connected to these
-protocols are flying blind: they can't see when an agent *considered* them and moved
-on, why it chose a competitor, or which prompt drove an order.
-
-AOP is an intelligent middleware proxy that sits between the agent protocols and a
-headless Shopify/BigCommerce backend. It:
-
-- **Intercepts intent** — every `GET /availability` and `POST /shipping_quote` probe
-  is transparently proxied to the merchant origin while a telemetry record is fired
-  into an async queue (adding <5ms of edge overhead).
-- **Reconstructs cookie-less attribution** — the `X-Agent-Transaction-Token` header
-  captured at the edge is stitched to Shopify `orders/create` webhooks, reconciling
-  agent-driven orders and computing the platform's flat **0.5% commission on
-  reconciled GMV** (enforced by a database generated column — billing math lives in
-  the schema, not app code). `refunds/create` and `orders/cancelled` webhooks feed
-  an immutable credit ledger (`order_adjustments`), so statements bill **net of
-  refunds**, per merchant per currency.
-- **Diagnoses losses** — intents that expire without a conversion inside the
-  60-second window are classified (`PRICE_DISCREPANCY`, `SHIPPING_LATENCY`,
-  `STOCK_OUTAGE`, `POLICY_AMBIGUITY`, `PROTOCOL_ERROR`, `UNKNOWN_DROPOFF`) into a
-  loss-diagnostics ledger.
-- **Optimizes the merchant's data** — a Python engine simulates how an LLM evaluates
-  raw policy text, produces an **Agent Match Score (0–100)** plus a normalized
-  selection probability, and emits exact semantic rewrites that recover lost points.
 
 ## Data flow
 
